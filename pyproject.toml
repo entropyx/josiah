@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "josiah"
+version = "0.1.0"
+description = "A package for generating synthetic MMM data"
+authors = [{name = "Arturo Díaz", email = "arturo@entropy.tech"}]
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.20.0",
+    "matplotlib>=3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/entropyx/josiah" 
