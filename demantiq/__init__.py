@@ -11,6 +11,7 @@ from demantiq.config.interaction_config import InteractionConfig, CustomInteract
 from demantiq.core.demand_kernel import SimulationResult, simulate
 from demantiq.scenarios.scenario_library import ScenarioLibrary
 from demantiq.orchestration.monte_carlo import MonteCarloRunner
+from demantiq.calibration.realism_validator import RealismValidator
 
 
 class Simulator:
@@ -44,4 +45,5 @@ __all__ = [
     "SimulationResult",
     "ScenarioLibrary",
     "MonteCarloRunner",
+    "RealismValidator",
 ]
