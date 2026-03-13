@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "josiah"
+version = "0.2.0"
+description = "Synthetic MMM data generator for validating Marketing Mix Models"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Arturo Diaz", email = "arturo@entropy.tech"},
+]
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.20.0",
+    "matplotlib>=3.0.0",
+    "plotly>=5.0.0",
+    "streamlit>=1.20.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/entropyx/josiah"
+
+[tool.setuptools.packages.find]
+include = ["josiah*"]
