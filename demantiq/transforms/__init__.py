@@ -7,3 +7,6 @@ from demantiq.transforms.adstock import (
     geometric, weibull_cdf, weibull_pdf, delayed_geometric,
     get_adstock_fn, ADSTOCK_FNS,
 )
+from demantiq.transforms.interactions import (
+    multiplicative_interaction, additive_interaction, apply_all_interactions,
+)

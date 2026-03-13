@@ -2,3 +2,4 @@ from demantiq.ground_truth.contributions import compute_contributions
 from demantiq.ground_truth.roas_calculator import compute_roas
 from demantiq.ground_truth.margin_attribution import compute_margin
 from demantiq.ground_truth.elasticities import compute_price_elasticity
+from demantiq.ground_truth.counterfactuals import compute_counterfactual

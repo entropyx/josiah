@@ -97,6 +97,11 @@ class SimulationConfig:
             from demantiq.config.macro_config import MacroConfig
             macro = MacroConfig.from_dict(d["macro"])
 
+        interactions = None
+        if "interactions" in d:
+            from demantiq.config.interaction_config import InteractionConfig
+            interactions = InteractionConfig.from_dict(d["interactions"])
+
         return cls(
             n_periods=d.get("n_periods", 104),
             granularity=d.get("granularity", "weekly"),
@@ -110,4 +115,5 @@ class SimulationConfig:
             endogeneity=endogeneity,
             competition=competition,
             macro=macro,
+            interactions=interactions,
         )

@@ -19,6 +19,9 @@ M3 adds:
   3. Endogeneity (feedback loops and confounding)
   10. Competition effect (competitor SOV suppression)
   11. Macro effects (external variables and regime changes)
+
+M4 adds:
+  7. Interactions (cross-variable modifiers on media effects)
 """
 
 import numpy as np
@@ -111,26 +114,18 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         # Step 6: Media effect = beta * saturated
         channel_contributions[ch.name] = ch.beta * ch_saturated
 
-    # Step 12: Aggregate demand
-    total_media = np.zeros(n)
-    for contrib in channel_contributions.values():
-        total_media += contrib
-
-    demand_clean = baseline + total_media
-
+    # Generate auxiliary results needed before interactions
     # Step 8: Price effect (if pricing configured)
     pricing_result = None
     if config.pricing is not None:
         from demantiq.generators.pricing_engine import generate_pricing
         pricing_result = generate_pricing(config.pricing, n, sub_rngs[3])
-        demand_clean = demand_clean + pricing_result.price_effect
 
     # Step 9: Distribution cap (if distribution configured)
     distribution_result = None
     if config.distribution is not None:
         from demantiq.generators.distribution_generator import generate_distribution
         distribution_result = generate_distribution(config.distribution, n, sub_rngs[4])
-        demand_clean = demand_clean * distribution_result.distribution_cap
 
     # Step 10: Competition effect (if configured)
     competition_result = None
@@ -143,6 +138,32 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     if config.macro is not None:
         from demantiq.generators.macro_generator import generate_macro
         macro_result = generate_macro(config.macro, n, sub_rngs[7])
+
+    # Step 7: Apply interactions (if configured)
+    interaction_details = None
+    if config.interactions is not None:
+        from demantiq.transforms.interactions import apply_all_interactions
+        channel_contributions, interaction_details = apply_all_interactions(
+            channel_contributions, config.interactions,
+            pricing_result=pricing_result,
+            distribution_result=distribution_result,
+            competition_result=competition_result,
+        )
+
+    # Step 12: Aggregate demand
+    total_media = np.zeros(n)
+    for contrib in channel_contributions.values():
+        total_media += contrib
+
+    demand_clean = baseline + total_media
+
+    # Apply price effect to demand
+    if pricing_result is not None:
+        demand_clean = demand_clean + pricing_result.price_effect
+
+    # Apply distribution cap to demand
+    if distribution_result is not None:
+        demand_clean = demand_clean * distribution_result.distribution_cap
 
     # Add competition effect
     if competition_result is not None:
@@ -178,12 +199,14 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     # Build ground truth
     gt = _build_ground_truth(config, baseline, channel_contributions, noise, y,
                              pricing_result, distribution_result,
-                             endog_result, competition_result, macro_result)
+                             endog_result, competition_result, macro_result,
+                             interaction_details)
 
     # Build summary truth
     summary = _build_summary(config, channel_contributions, spend, channel_scales, y,
                              pricing_result, margin_info,
-                             endog_result, competition_result, macro_result)
+                             endog_result, competition_result, macro_result,
+                             interaction_details)
 
     return SimulationResult(
         observable_data=observable,
@@ -245,7 +268,8 @@ def _build_ground_truth(config: SimulationConfig, baseline: np.ndarray,
                         noise: np.ndarray, y: np.ndarray,
                         pricing_result=None, distribution_result=None,
                         endog_result=None, competition_result=None,
-                        macro_result=None) -> pd.DataFrame:
+                        macro_result=None,
+                        interaction_details=None) -> pd.DataFrame:
     """Build the ground truth DataFrame."""
     n = config.n_periods
 
@@ -283,6 +307,11 @@ def _build_ground_truth(config: SimulationConfig, baseline: np.ndarray,
         data["true_macro_effect"] = macro_result.macro_effect
         data["true_regime_effects"] = macro_result.regime_effects
 
+    # Add interaction ground truth
+    if interaction_details is not None:
+        for detail_name, detail_vals in interaction_details.items():
+            data[f"true_interaction_{detail_name}"] = detail_vals
+
     data["true_noise"] = noise
     data["y"] = y
 
@@ -298,7 +327,8 @@ def _build_summary(config: SimulationConfig,
                    margin_info=None,
                    endog_result=None,
                    competition_result=None,
-                   macro_result=None) -> dict:
+                   macro_result=None,
+                   interaction_details=None) -> dict:
     """Build the summary ground truth dict."""
     total_y = float(np.sum(y))
 
@@ -371,5 +401,15 @@ def _build_summary(config: SimulationConfig,
             "variables": [v.name for v in config.macro.variables],
             "n_regime_changes": len(config.macro.regime_changes),
         }
+
+    # Add interaction summary
+    if interaction_details is not None:
+        interaction_summary = {}
+        for detail_name, detail_vals in interaction_details.items():
+            interaction_summary[detail_name] = {
+                "total_effect": float(np.sum(detail_vals)),
+                "mean_effect": float(np.mean(detail_vals)),
+            }
+        summary["interactions"] = interaction_summary
 
     return summary
