@@ -1,0 +1,135 @@
+# Milestone 3: Endogeneity + Competition
+# Runs in parallel with M2. Adds endogeneity layer, competition module, macro variables.
+
+name: m3-endog-comp
+description: Add endogeneity, competition, and macro variables to the demand kernel
+depends_on: [m1-core-dgp]
+
+tasks:
+  - name: configs
+    agent: builder
+    description: |
+      Build demantiq/config/:
+      - endogeneity_config.py: EndogeneityConfig:
+        - overall_strength: float (0.0=exogenous, 1.0=fully endogenous)
+        - feedback_lag: int (periods back outcome feeds into spend)
+        - feedback_channels: list[str] (which channels react to outcome)
+        - seasonal_allocation_bias: float (spend increases during high-baseline periods)
+        - performance_chasing: float (spend chases recent performance)
+        - algorithmic_targeting_bias: float (platform optimization simulation)
+        - price_endogeneity: float (pricing reacts to demand signals)
+        - distribution_endogeneity: float (distribution expands into high-demand areas)
+      - competition_config.py: CompetitionConfig:
+        - n_competitors: int
+        - competitor_sov_mean: float
+        - competitor_sov_pattern: str (stable|seasonal|reactive|random)
+        - sov_suppression_coefficient: float
+        - competitor_price_actions: bool
+        - competitive_intensity_trend: str (stable|increasing|decreasing)
+      - macro_config.py: MacroConfig:
+        - variables: list[MacroVariable] (name, effect_on_demand, time_series_type, params,
+          correlation_with_spend)
+        - regime_changes: list[RegimeChange] (period, type, magnitude, affected_params,
+          recovery, recovery_periods)
+        MacroVariable types: random_walk, mean_reverting, trending, seasonal, from_data
+        RegimeChange types: level_shift, trend_break, variance_change, parameter_change
+
+  - name: endogeneity-layer
+    agent: builder
+    depends_on: [configs]
+    description: |
+      Build demantiq/core/endogeneity_layer.py:
+      - apply_endogeneity(spend_raw, baseline, outcome_history, config, rng) -> spend_endogenous
+      - Feedback mechanisms:
+        - Linear: spend += strength * f(y_{t-lag})
+        - Threshold: spend increases only when outcome exceeds target
+        - Momentum: spend increases when outcome trending up
+        - Algorithmic: spend concentrates on high-propensity periods
+      - Seasonal allocation bias:
+        spend *= (1 + bias * seasonality_t / max(seasonality))
+      - Omitted variable confounding (FR-END-003):
+        - Generate hidden z_t ~ AR(1)
+        - x_confounded = x + alpha_spend * z_t
+        - y_confounded = y + alpha_outcome * z_t
+        - z_t is in ground truth but NOT in observable data
+      - Track exogenous_spend (pre-endogeneity) and endogeneity_bias per channel
+
+  - name: competition-generator
+    agent: builder
+    depends_on: [configs]
+    description: |
+      Build demantiq/generators/competition_generator.py:
+      - generate_competition(config: CompetitionConfig, n_periods: int, rng) -> CompetitionResult
+      - CompetitionResult: competitor_sov (ndarray), competition_effect (ndarray)
+      - SOV patterns: stable (constant), seasonal (follows demand seasonality),
+        reactive (increases when own spend increases), random (noise around mean)
+      - Competitive intensity trend: stable, increasing (market gets more competitive),
+        decreasing (competitors exit)
+      - Suppression: competition_effect = sov_suppression * competitor_sov (reduces media effectiveness)
+
+  - name: macro-generator
+    agent: builder
+    depends_on: [configs]
+    description: |
+      Build demantiq/generators/macro_generator.py:
+      - generate_macro(config: MacroConfig, n_periods: int, rng) -> MacroResult
+      - MacroResult: variables dict[str, ndarray], regime_effects (ndarray)
+      - Time series types:
+        - random_walk: x_t = x_{t-1} + eps
+        - mean_reverting: x_t = mu + phi*(x_{t-1} - mu) + eps
+        - trending: x_t = x_0 + slope*t + eps
+        - seasonal: Fourier-based seasonal pattern
+      - Regime changes:
+        - level_shift: permanent step up/down at specified period
+        - trend_break: slope change at specified period
+        - variance_change: noise level change at specified period
+        - parameter_change: modify any config parameter at specified period
+      - Recovery types: permanent, gradual_recovery, v_shaped
+      - Correlation with spend: macro variables that correlate with spend create OVB
+
+  - name: integrate-kernel
+    agent: builder
+    depends_on: [endogeneity-layer, competition-generator, macro-generator]
+    description: |
+      Update demantiq/core/demand_kernel.py to add steps 3, 10-11:
+      - Step 3: Apply endogeneity (endogeneity_layer)
+      - Step 10: Compute competition effect (competition_generator)
+      - Step 11: Compute macro effects (macro_generator)
+      - Add competitor_sov, macro variables to observable_data
+      - Add confounders, exogenous_spend, endogeneity_bias to ground_truth
+      - Add true_competition_effect, true_macro_effect to ground_truth
+      Note: endogeneity step requires iterative computation — must handle feedback loop
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [integrate-kernel]
+    description: |
+      Write tests:
+      - test_config/test_endogeneity_config.py
+      - test_config/test_competition_config.py
+      - test_config/test_macro_config.py
+      - test_core/test_endogeneity_layer.py:
+        - With strength=0, spend unchanged
+        - With strength>0, spend correlates with lagged outcome
+        - OVB confounders present in ground truth but not observable
+        - Endogeneity bias matches analytical prediction (Appendix B):
+          bias ≈ gamma*beta*sigma²_x / (sigma²_x + gamma²*sigma²_y) within 10%
+      - test_generators/test_competition_generator.py:
+        - SOV in valid range, pattern matches config
+        - Suppression reduces media effectiveness
+      - test_generators/test_macro_generator.py:
+        - Random walk has unit root, mean-reverting reverts
+        - Regime changes occur at correct period
+        - Recovery types work correctly
+      - test_integration/test_scn003_adversarial.py:
+        - Generate SCN-003 config, run OLS, verify bias is demonstrably > 0
+        - Verify bias direction matches endogeneity direction
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/ -v --tb=short
+      Verify: SCN-003 OLS bias matches analytical prediction within 10%
+      Verify: no regressions in M1 tests
+      Verify: confounders not leaked into observable data

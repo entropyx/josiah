@@ -1,0 +1,102 @@
+# Milestone 4: Full Interaction Matrix
+# Adds cross-variable interactions to the demand kernel, completing all 15 steps.
+
+name: m4-interactions
+description: Add all pairwise interaction functions to the demand kernel
+depends_on: [m2-pricing-dist, m3-endog-comp]
+
+tasks:
+  - name: interaction-config
+    agent: builder
+    description: |
+      Build demantiq/config/interaction_config.py:
+      - InteractionConfig frozen dataclass:
+        - price_x_media: dict[str, float] (per-channel price*media interaction coefficient)
+        - distribution_x_media: dict[str, float] (per-channel distribution*media interaction)
+        - media_x_media: dict[tuple[str,str], float] (pairwise media synergy/cannibalization)
+        - price_x_seasonality: float (how price elasticity varies with seasonal demand)
+        - competition_x_media: dict[str, float] (competitive pressure modifies per-channel effectiveness)
+        - custom_interactions: list[CustomInteraction] (arbitrary interaction specs)
+      - CustomInteraction frozen dataclass:
+        - variable_a: str
+        - variable_b: str
+        - coefficient: float
+        - interaction_type: str (multiplicative|additive)
+
+  - name: interaction-transforms
+    agent: builder
+    depends_on: [interaction-config]
+    description: |
+      Build demantiq/transforms/interactions.py:
+      - multiplicative_interaction(effect, modifier, coefficient):
+        effect_modified = effect * (1 + coefficient * modifier)
+      - additive_interaction(effect, modifier, coefficient):
+        effect_modified = effect + coefficient * modifier
+      - apply_all_interactions(media_effects, config, price, distribution, competition, macro):
+        For each channel, apply all configured interactions in order:
+        1. price_x_media: media *= (1 + gamma * promo_indicator)
+        2. distribution_x_media: media *= (1 + gamma * distribution)
+        3. media_x_media: media_a *= (1 + gamma * media_b_saturated) for each pair
+        4. competition_x_media: media *= (1 - gamma * competitor_sov)
+        5. custom_interactions: apply in order
+        Return modified media effects and interaction effect magnitudes per pair per period.
+
+  - name: integrate-kernel
+    agent: builder
+    depends_on: [interaction-transforms]
+    description: |
+      Update demantiq/core/demand_kernel.py to add step 7:
+      - Step 7: Apply interactions (interactions.apply_all_interactions)
+      - Now all 15 steps are implemented
+      - Add true_interaction_{i}_{j} columns to ground_truth DataFrame
+      - Add true_interactions dict to summary_truth
+
+  - name: ground-truth-updates
+    agent: builder
+    depends_on: [integrate-kernel]
+    description: |
+      Build demantiq/ground_truth/:
+      - interaction_effects.py:
+        - compute_interaction_magnitudes(interactions, media, price, dist, comp) -> dict
+        - Per interaction pair, per period: magnitude of the interaction effect
+        - Total interaction contribution to demand
+      - counterfactuals.py:
+        - compute_counterfactual(config, channel_to_zero) -> float
+        - "What would demand be if channel X had zero spend?"
+        - Must account for: adstock (zero removes carryover), interactions (removing one
+          channel may reduce synergistic channels), distribution ceiling
+        - Re-run kernel with zeroed channel spend to compute true counterfactual
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [ground-truth-updates]
+    description: |
+      Write tests:
+      - test_config/test_interaction_config.py
+      - test_transforms/test_interactions.py:
+        - Multiplicative: with coefficient=0, no change
+        - Additive: linear effect
+        - Symmetry of media_x_media where expected
+      - test_ground_truth/test_interaction_effects.py:
+        - Interaction magnitudes match hand-computed values for simple cases
+      - test_ground_truth/test_counterfactuals.py:
+        - Zero-spend counterfactual < actual demand (for positive beta channels)
+        - Counterfactual accounts for interaction loss
+      - test_core/test_demand_kernel_full.py:
+        - All 15 steps execute without error
+        - Ground truth ledger is complete (all columns present)
+        - Internal consistency: contributions + interactions + baseline ≈ total demand
+      - test_integration/test_scn005_interaction_heavy.py:
+        - Define SCN-005 with large price*media and distribution*media interactions
+        - Verify interaction columns non-zero
+        - Verify counterfactuals correctly reflect interaction removal
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/ -v --tb=short
+      Verify: SCN-005 generates valid data with non-zero interactions
+      Verify: all 15 kernel steps execute
+      Verify: ground truth ledger complete
+      Verify: no regressions

@@ -22,5 +22,13 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/entropyx/josiah"
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "hypothesis>=6.0",
+    "scipy>=1.9.0",
+    "pyyaml>=6.0",
+]
+
 [tool.setuptools.packages.find]
-include = ["josiah*"]
+include = ["josiah*", "demantiq*"]

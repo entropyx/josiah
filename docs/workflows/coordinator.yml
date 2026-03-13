@@ -1,0 +1,113 @@
+# Demantiq Simulator — Coordinator Workflow
+# Top-level orchestrator that sequences milestone execution.
+# Fully autonomous: runs end-to-end, validates at each gate, only surfaces on failure.
+
+name: demantiq-coordinator
+description: Orchestrate the full Demantiq simulator build across 8 milestones
+
+config:
+  working_directory: /Users/arturodz/conductor/workspaces/josiah/semarang
+  spec_file: docs/specs/2026-03-13-demantiq-simulator-design.md
+  prd_file: docs/prd.md
+  milestone_tracker: docs/project/milestones.md
+  stage_status: docs/project/stage-status.md
+
+stages:
+  - name: m1-core-dgp
+    workflow: docs/workflows/m1-core-dgp.yml
+    parallel: false
+    gate:
+      - "pytest tests/demantiq/ -v --tb=short"
+      - "python -c \"from demantiq import Simulator, SimulationConfig; r = Simulator(SimulationConfig(channels=[...])).run(); assert r.observable_data.shape[0] > 0\""
+    on_success: update milestones.md M1 status to completed
+    on_failure: surface error to user
+
+  - name: m2-m3-parallel
+    parallel: true
+    workflows:
+      - docs/workflows/m2-pricing-dist.yml
+      - docs/workflows/m3-endog-comp.yml
+    gate:
+      - "pytest tests/demantiq/ -v --tb=short"
+    on_success: update milestones.md M2+M3 status to completed
+
+  - name: m4-interactions
+    workflow: docs/workflows/m4-interactions.yml
+    parallel: false
+    depends_on: [m2-m3-parallel]
+    gate:
+      - "pytest tests/demantiq/ -v --tb=short"
+    on_success: update milestones.md M4 status to completed
+
+  - name: m5-scenarios-mc
+    workflow: docs/workflows/m5-scenarios-mc.yml
+    parallel: false
+    depends_on: [m4-interactions]
+    gate:
+      - "pytest tests/demantiq/ -v --tb=short"
+      - "python -c \"from demantiq.scenarios import ScenarioLibrary; assert len(ScenarioLibrary.list_all()) == 15\""
+    on_success: update milestones.md M5 status to completed
+
+  - name: m6-evaluation
+    workflow: docs/workflows/m6-evaluation.yml
+    parallel: false
+    depends_on: [m5-scenarios-mc]
+    gate:
+      - "pytest tests/demantiq/test_evaluation/ -v --tb=short"
+
+  - name: m7-calibration
+    workflow: docs/workflows/m7-calibration.yml
+    parallel: false
+    depends_on: [m5-scenarios-mc]
+    gate:
+      - "pytest tests/demantiq/test_calibration/ -v --tb=short"
+
+  - name: m8-training-data
+    workflow: docs/workflows/m8-training-data.yml
+    parallel: false
+    depends_on: [m5-scenarios-mc]
+    gate:
+      - "pytest tests/demantiq/test_orchestration/ -v --tb=short"
+
+  - name: ui-streamlit
+    description: Build Streamlit pages incrementally after each backend milestone
+    parallel: false
+    depends_on: [m5-scenarios-mc]
+    gate:
+      - "streamlit run app.py --server.headless true &; sleep 5; curl -s http://localhost:8501 | grep -q 'Streamlit'; kill %1"
+
+agents:
+  coordinator:
+    role: Sequences milestones, manages dependencies, updates milestone tracker
+    context:
+      - docs/specs/2026-03-13-demantiq-simulator-design.md
+      - docs/project/milestones.md
+      - docs/prd.md
+
+  builder:
+    role: Writes implementation code for a specific module
+    context:
+      - docs/specs/2026-03-13-demantiq-simulator-design.md
+      - docs/prd.md
+      - Relevant section of demantiq/ package
+
+  test-writer:
+    role: Writes unit, integration, and property-based tests
+    context:
+      - Implementation code being tested
+      - PRD acceptance criteria
+      - Testing strategy from design spec
+
+  validator:
+    role: Runs acceptance criteria, verifies correctness
+    context:
+      - Milestone acceptance criteria from design spec
+      - Test results
+      - Ground truth verification
+
+  ui-builder:
+    role: Builds Streamlit pages after backend milestones complete
+    context:
+      - Existing pages/ for style reference
+      - Backend API (demantiq.__init__)
+      - UI design from spec section 9

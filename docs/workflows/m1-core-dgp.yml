@@ -1,0 +1,187 @@
+# Milestone 1: Core DGP
+# Foundation milestone — all subsequent milestones depend on this.
+
+name: m1-core-dgp
+description: Build the core demand kernel with media channels, saturation, adstock, baseline, noise
+
+tasks:
+  - name: scaffold-package
+    agent: builder
+    description: |
+      Create the demantiq/ package structure with __init__.py files.
+      Create tests/demantiq/ structure.
+      Update pyproject.toml to include demantiq as a package.
+      Add test dependencies (pytest, hypothesis, scipy).
+
+  - name: utils
+    agent: builder
+    depends_on: [scaffold-package]
+    description: |
+      Build demantiq/utils/:
+      - random.py: Seeded RNG management. create_rng(seed) returns numpy Generator.
+        Must support deterministic sub-seeding for components (spend, noise, etc.).
+      - distributions.py: Custom probability distributions for spend generation.
+        Log-normal and gamma with configurable params. Truncated distributions.
+      - time_series.py: Fourier seasonality, linear/cube-root trend, structural break utils.
+      - correlation.py: Generate correlation matrices. Gaussian copula for correlated spend.
+
+  - name: config-system
+    agent: builder
+    depends_on: [scaffold-package]
+    description: |
+      Build demantiq/config/:
+      - simulation_config.py: Master SimulationConfig frozen dataclass.
+        Fields: n_periods, granularity, channels, noise, baseline, seed, metadata.
+        Optional fields (pricing, distribution, etc.) default to None for M1.
+      - channel_config.py: ChannelConfig with name, beta, saturation_fn, saturation_params,
+        adstock_fn, adstock_params, spend_pattern, spend_mean, spend_std, spend_floor,
+        correlation_group.
+      - baseline_config.py: BaselineConfig with trend_type, trend_params, seasonality_type,
+        seasonality_params (n_terms, coefficients), organic_level.
+      - noise_config.py: NoiseConfig with noise_type (gaussian|t_distributed|heteroscedastic|
+        autocorrelated), noise_scale, signal_to_noise_ratio, autocorrelation,
+        heteroscedasticity_fn, outlier_probability, outlier_magnitude.
+      All configs must be frozen dataclasses with validation, defaults, and to_dict/from_dict.
+
+  - name: transforms
+    agent: builder
+    depends_on: [utils]
+    description: |
+      Build demantiq/transforms/:
+      - saturation.py:
+        - hill(x, K, S): x^S / (K^S + x^S). K=half-saturation, S=shape.
+        - logistic(x, k, x0): 1 / (1 + exp(-k*(x - x0))).
+        - power(x, alpha): x^alpha where 0 < alpha < 1.
+        - piecewise_linear(x, breakpoints, slopes): Linear segments.
+        - Registry: SATURATION_FNS dict mapping name -> function.
+      - adstock.py:
+        - geometric(x, alpha): y_t = x_t + alpha * y_{t-1}.
+        - weibull_cdf(x, shape, scale, max_lag): Weights from Weibull CDF.
+        - weibull_pdf(x, shape, scale, max_lag): Weights from Weibull PDF.
+        - delayed_geometric(x, alpha, delay): Zero for delay periods, then geometric.
+        - Registry: ADSTOCK_FNS dict mapping name -> function.
+      All functions must be pure (no side effects), accept numpy arrays, return same shape.
+      Include inverse functions for saturation (needed for counterfactuals later).
+
+  - name: generators
+    agent: builder
+    depends_on: [utils, config-system]
+    description: |
+      Build demantiq/generators/:
+      - spend_generator.py:
+        - generate_spend(channels, n_periods, rng) -> dict[str, ndarray]
+        - Support spend_pattern types: always_on, pulsed, seasonal, front_loaded
+        - Correlated spend via Gaussian copula for channels in same correlation_group
+        - Log-normal or gamma marginals (right-skewed, non-negative)
+        - Flighting: configurable flight_duration, dark_duration, spend_multiplier
+        - Budget constraints: optional total spend cap per channel
+      - baseline_generator.py:
+        - generate_baseline(config, n_periods, rng) -> ndarray
+        - Combines: trend (linear or cube_root) + seasonality (Fourier) + organic_level
+        - Must match PRD step 1: base_t = trend_t + seasonality_t + organic_level
+
+  - name: noise-model
+    agent: builder
+    depends_on: [config-system]
+    description: |
+      Build demantiq/core/noise_model.py:
+      - generate_noise(config, demand, rng) -> ndarray
+      - Gaussian: N(0, scale)
+      - t-distributed: t(df, 0, scale)
+      - Heteroscedastic: variance scales with demand level via configurable function
+      - Autocorrelated: AR(1) with configurable coefficient
+      - Outliers: with configurable probability and magnitude
+      - SNR mode: if signal_to_noise_ratio is set, compute scale from demand variance
+
+  - name: demand-kernel
+    agent: builder
+    depends_on: [transforms, generators, noise-model]
+    description: |
+      Build demantiq/core/demand_kernel.py:
+      - simulate(config: SimulationConfig) -> SimulationResult
+      - For M1, implement steps 1, 2, 4, 5, 6, 12, 13 (skip 3, 7-11, 14-15):
+        1. Generate baseline (baseline_generator)
+        2. Generate raw spend (spend_generator)
+        4. Apply adstock per channel (from registry)
+        5. Apply saturation per channel (normalize spend by max|spend| first, from registry)
+        6. Compute media effects (beta * saturated)
+        12. Aggregate demand (base + sum of media effects)
+        13. Add noise (noise_model)
+      - Return SimulationResult with observable_data (DataFrame), ground_truth (DataFrame),
+        summary_truth (dict), config.
+      - Observable columns: date, y, {channel}_spend
+      - Ground truth columns: date, true_baseline, true_{channel}_contribution, true_noise, y
+
+  - name: ground-truth
+    agent: builder
+    depends_on: [demand-kernel]
+    description: |
+      Build demantiq/ground_truth/:
+      - contributions.py:
+        - compute_contributions(media_effects, total_demand) -> dict per channel per period
+        - Both absolute and percentage contributions
+      - roas_calculator.py:
+        - compute_roas(contributions, spend) -> dict[str, float] per channel
+        - ROAS = total_contribution / total_spend
+      Summary truth dict must include: true_betas, true_saturation_params, true_adstock_params,
+      true_roas, true_total_media_contribution_pct, config, seed.
+
+  - name: serializer
+    agent: builder
+    depends_on: [config-system]
+    description: |
+      Build demantiq/orchestration/serializer.py:
+      - config_to_json(config) -> str
+      - config_from_json(json_str) -> SimulationConfig
+      - config_to_yaml(config) -> str
+      - config_from_yaml(yaml_str) -> SimulationConfig
+      Must handle nested dataclasses, enums, numpy types.
+      Round-trip: from_json(to_json(config)) == config.
+
+  - name: public-api
+    agent: builder
+    depends_on: [demand-kernel, ground-truth, serializer]
+    description: |
+      Build demantiq/__init__.py:
+      - Export: Simulator, SimulationConfig, ChannelConfig, BaselineConfig, NoiseConfig
+      - Simulator class wraps demand_kernel.simulate() with config validation
+      - Simulator.run() -> SimulationResult
+      - SimulationResult dataclass: observable_data, ground_truth, summary_truth, config
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [public-api]
+    description: |
+      Write comprehensive tests in tests/demantiq/:
+      - test_transforms/test_saturation.py:
+        - Each function: f(0)=0, monotonically increasing, bounded, known analytical values
+        - Hill: f(K)=0.5, f(inf)->1
+        - Logistic: f(x0)=0.5
+      - test_transforms/test_adstock.py:
+        - Geometric: with alpha=0 returns input, with alpha=1 returns cumsum
+        - Weibull: weights sum to ~1 (approximately), peak location matches shape param
+        - Delayed geometric: zero for delay periods
+      - test_generators/test_spend_generator.py:
+        - Non-negativity, correct shape, correlation structure within groups
+        - Flighting patterns produce zero periods
+      - test_generators/test_baseline_generator.py:
+        - Trend direction matches config, seasonality has correct period
+      - test_core/test_noise_model.py:
+        - Distribution shape matches config, autocorrelation coefficient
+      - test_core/test_demand_kernel.py:
+        - Full pipeline produces valid DataFrame
+        - Contributions sum to total demand (within tolerance)
+        - ROAS > 0 for positive betas
+        - Deterministic with same seed
+      - test_integration/:
+        - test_scn001_clean_room.py: Define SCN-001 config manually, generate data,
+          run OLS, verify beta recovery within 5%
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run full test suite: pytest tests/demantiq/ -v --tb=short
+      Run acceptance test: SCN-001 OLS recovery
+      Verify: all tests pass, no import errors, no NaN in outputs
+      If failures: report back to builder agents for fixes
