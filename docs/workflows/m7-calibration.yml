@@ -1,0 +1,88 @@
+# Milestone 7: Calibration v1 (API-only)
+# Empirical parameter distributions and realism validation.
+
+name: m7-calibration
+description: Build calibration system with empirical distributions and realism validator
+depends_on: [m5-scenarios-mc]
+
+tasks:
+  - name: empirical-distributions
+    agent: builder
+    description: |
+      Build demantiq/calibration/empirical_distributions.py:
+      - EmpiricalDistributions class:
+        - load(path: str) -> EmpiricalDistributions (from JSON)
+        - save(path: str)
+        - add_observation(lever_type, business_context, parameter, value, confidence_interval,
+          source, client_id)
+        - get_distribution(lever_type, business_context, parameter) -> scipy.stats distribution
+        - get_range(lever_type, business_context, parameter) -> (low, high)
+      - Initial data from PRD Appendix C (category benchmarks):
+        - Media/revenue ratios by category
+        - Price elasticity ranges by category
+        - Typical channel counts
+        - Seasonal amplitude by category
+      - Lever types: paid_social_upper_funnel, paid_search_brand, paid_search_nonbrand,
+        display_prospecting, display_retargeting, ctv, linear_tv, ooh, print, email, etc.
+      - Sources: geo_lift, brand_lift, academic, public_financial, internal_estimate
+
+  - name: public-data-adapter
+    agent: builder
+    description: |
+      Build demantiq/calibration/public_data_adapter.py:
+      - PublicDataAdapter class:
+        - ingest_category_benchmarks(category: str) -> dict
+        - get_media_revenue_ratio(category: str) -> (low, high)
+        - get_typical_channels(category: str) -> list[str]
+        - get_seasonal_pattern(category: str) -> dict
+      - Hardcoded initial data from PRD Appendix C:
+        supplements, dtc_skincare, qsr, financial_services, online_education,
+        consumer_electronics, automotive, cpg_fmcg
+      - Extensible: interface for future API-based data ingestion
+
+  - name: realism-validator
+    agent: builder
+    description: |
+      Build demantiq/calibration/realism_validator.py:
+      - RealismValidator class:
+        - __init__(reference_data: DataFrame | None = None, category: str | None = None)
+        - validate(synthetic_data: DataFrame) -> ValidationReport
+      - ValidationReport:
+        - pass_fail: bool
+        - flagged_properties: list[str]
+        - details: dict[str, TestResult]
+      - Statistical tests (from PRD FR-CAL-002):
+        - Spend distribution shape: KS test against reference or category benchmark
+        - Spend autocorrelation: Compare ACF structure (first 10 lags)
+        - Outcome seasonality: Fourier spectrum comparison
+        - Channel collinearity: Compare correlation matrices (Frobenius norm)
+        - Spend-to-revenue ratio: Within category range
+        - Coefficient of variation: Matches observed variability range
+        - Outlier frequency: Consistent with expectations
+      - Fail threshold: p < 0.05 or outside category benchmarks
+      - If no reference_data, validate against category benchmarks only
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [empirical-distributions, public-data-adapter, realism-validator]
+    description: |
+      Write tests:
+      - test_calibration/test_empirical_distributions.py:
+        - Add/retrieve observations round-trip
+        - Category benchmarks loaded correctly
+        - JSON serialization round-trip
+      - test_calibration/test_public_data_adapter.py:
+        - All 8 categories return valid benchmarks
+        - Media/revenue ratios in expected ranges
+      - test_calibration/test_realism_validator.py:
+        - SCN-001 (Clean Room) passes validation
+        - Artificially unrealistic data fails validation
+        - All statistical tests produce valid p-values
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/test_calibration/ -v --tb=short
+      Verify: realism validator runs on all 15 scenarios
+      Verify: parameter ranges align with Appendix C

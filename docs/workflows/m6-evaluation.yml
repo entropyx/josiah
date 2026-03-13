@@ -1,0 +1,127 @@
+# Milestone 6: Evaluation Framework (API-only)
+# Full evaluation suite and model comparison. No Streamlit UI — consumed by MMM service.
+
+name: m6-evaluation
+description: Build evaluation metrics, capability surface, and model comparison framework
+depends_on: [m5-scenarios-mc]
+
+tasks:
+  - name: parameter-recovery
+    agent: builder
+    description: |
+      Build demantiq/evaluation/parameter_recovery.py:
+      - ParameterRecovery class:
+        - evaluate(estimated: dict, truth: dict) -> RecoveryResult
+      - RecoveryResult:
+        - bias: dict[str, float] (E[theta] - theta* per parameter)
+        - mape: dict[str, float] (|E[theta] - theta*| / |theta*|)
+        - coverage: dict[str, float] (P(theta* in 95% CI) — requires posterior samples)
+        - interval_width: dict[str, float] (width of 95% CI)
+        - rank_correlation: float (Spearman rho between true and estimated channel rankings)
+      - Targets: bias < 10% of theta*, MAPE < 15%, coverage 90-95%, rank corr > 0.85
+
+  - name: contribution-accuracy
+    agent: builder
+    description: |
+      Build demantiq/evaluation/contribution_accuracy.py:
+      - ContributionAccuracy class:
+        - evaluate(estimated_contributions: DataFrame, true_contributions: DataFrame) -> ContribResult
+      - ContribResult:
+        - total_media_error: float (|est_total - true_total| / true_total)
+        - per_channel_mape: dict[str, float]
+        - channel_ranking: float (Kendall's tau)
+        - zero_detection_rate: float (correctly identifies channels with true beta=0)
+      - Targets: total error < 10%, per-channel MAPE < 20%, ranking > 0.80, zero detection > 90%
+
+  - name: roas-accuracy
+    agent: builder
+    description: |
+      Build demantiq/evaluation/roas_accuracy.py:
+      - ROASAccuracy class:
+        - evaluate(estimated_roas: dict, true_roas: dict) -> ROASResult
+      - ROASResult:
+        - per_channel_mape: dict[str, float]
+        - ranking_correlation: float
+        - direction_accuracy: float (correctly identifies ROAS > 1 vs < 1)
+
+  - name: interaction-detection
+    agent: builder
+    description: |
+      Build demantiq/evaluation/interaction_detection.py:
+      - InteractionDetection class:
+        - evaluate(estimated_interactions: dict, true_interactions: dict) -> InteractionResult
+      - InteractionResult:
+        - detection_rate: float (true positives / total true interactions)
+        - false_positive_rate: float
+        - magnitude_mape: dict (per interaction pair)
+
+  - name: optimization-quality
+    agent: builder
+    description: |
+      Build demantiq/evaluation/optimization_quality.py:
+      - OptimizationQuality class:
+        - evaluate(model_allocation: dict, true_dgp: SimulationConfig, budget: float) -> OptResult
+      - OptResult:
+        - revenue_model: float (revenue under model's recommended allocation)
+        - revenue_true: float (revenue under true optimal allocation)
+        - optimization_efficiency: float (revenue_model / revenue_true)
+      - Requires re-running simulator with model's allocation to compute actual outcome
+      - Target: efficiency > 0.90
+
+  - name: capability-surface
+    agent: builder
+    description: |
+      Build demantiq/evaluation/capability_surface.py:
+      - CapabilitySurface class:
+        - __init__(dimensions, metric, results: MonteCarloResults)
+        - plot_heatmap(x, y, fix: dict) -> matplotlib Figure
+        - find_failure_boundary(threshold: float) -> dict (parameter values where accuracy degrades)
+        - compare_models(model_names: list[str]) -> comparison DataFrame
+      - Dimensions: collinearity, endogeneity, n_channels, n_periods, snr
+      - Bin results into grid cells, compute mean metric per cell
+
+  - name: model-comparison
+    agent: builder
+    description: |
+      Build demantiq/evaluation/model_comparison.py:
+      - ModelComparison class:
+        - __init__(models: dict[str, ModelAdapter], scenarios, metrics)
+        - run(n_seeds: int) -> ComparisonReport
+      - ModelAdapter protocol:
+        - fit(observable_data: DataFrame) -> ModelFit
+        - predict_contributions(fit: ModelFit) -> DataFrame
+        - predict_roas(fit: ModelFit) -> dict
+        - recommend_allocation(fit: ModelFit, budget: float) -> dict
+      - ComparisonReport:
+        - to_dataframe() -> DataFrame (model x scenario x metric)
+        - plot_comparison() -> Figure
+        - export_html(path)
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [parameter-recovery, contribution-accuracy, roas-accuracy, interaction-detection, optimization-quality, capability-surface, model-comparison]
+    description: |
+      Write tests:
+      - test_evaluation/test_parameter_recovery.py:
+        - Perfect estimates give zero bias and MAPE
+        - Known biased estimates give correct bias direction
+      - test_evaluation/test_contribution_accuracy.py:
+        - Identical contributions give zero error
+        - Shuffled rankings give low correlation
+      - test_evaluation/test_roas_accuracy.py
+      - test_evaluation/test_interaction_detection.py
+      - test_evaluation/test_optimization_quality.py:
+        - True optimal allocation gives efficiency = 1.0
+        - Random allocation gives efficiency < 1.0
+      - test_evaluation/test_capability_surface.py:
+        - Binning produces correct grid structure
+      - test_evaluation/test_model_comparison.py:
+        - Mock ModelAdapter, verify comparison runs end-to-end
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/test_evaluation/ -v --tb=short
+      Verify: all evaluation metrics compute correctly
+      Verify: no regressions

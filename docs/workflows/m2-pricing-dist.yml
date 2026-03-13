@@ -1,0 +1,120 @@
+# Milestone 2: Pricing + Distribution
+# Runs in parallel with M3. Adds pricing engine and distribution module to demand kernel.
+
+name: m2-pricing-dist
+description: Add pricing mechanics and distribution/availability to the demand kernel
+depends_on: [m1-core-dgp]
+
+tasks:
+  - name: pricing-config
+    agent: builder
+    description: |
+      Build demantiq/config/pricing_config.py:
+      - PricingConfig frozen dataclass:
+        - base_price: float (regular/shelf price)
+        - price_elasticity: float (true price elasticity of demand)
+        - promo_calendar: list[PromoEvent] (scheduled promotions with depth and duration)
+        - promo_frequency: str (weekly|biweekly|monthly|quarterly|custom)
+        - promo_depth_mean: float (average discount %)
+        - promo_depth_std: float (discount variation)
+        - price_media_interaction: float (how promos modify media lift, 0=no interaction)
+        - price_seasonality_interaction: float (how elasticity shifts during peak periods)
+        - competitor_price_sensitivity: float (cross-price elasticity)
+        - cost_structure: CostConfig (COGS, variable costs, contribution margin)
+      - CostConfig frozen dataclass:
+        - cogs_per_unit: float
+        - variable_cost_per_unit: float
+        - contribution_margin_at_base: float
+      - PromoEvent frozen dataclass:
+        - start_period: int
+        - duration: int
+        - depth: float (discount %)
+
+  - name: distribution-config
+    agent: builder
+    description: |
+      Build demantiq/config/distribution_config.py:
+      - DistributionConfig frozen dataclass:
+        - initial_distribution: float (0.0-1.0, starting weighted distribution)
+        - distribution_trajectory: str (stable|growing|declining|step_change|custom)
+        - trajectory_params: dict (growth rate, step-change date/magnitude)
+        - distribution_ceiling_effect: float (0=no ceiling, 1=hard ceiling on media-driven demand)
+        - distribution_media_interaction: float (media wasted where no distribution)
+        - stockout_probability: float (random stockout probability per period)
+        - stockout_demand_loss: float (fraction of demand lost during stockout)
+
+  - name: pricing-engine
+    agent: builder
+    depends_on: [pricing-config]
+    description: |
+      Build demantiq/generators/pricing_engine.py:
+      - generate_pricing(config: PricingConfig, n_periods: int, rng) -> PricingResult
+      - PricingResult: price (ndarray), is_promo (ndarray[bool]), promo_depth (ndarray)
+      - Generate promo calendar from frequency + depth distribution
+      - Apply seasonal variation to price elasticity if configured
+      - Compute price effect on demand: beta_price * log(price / base_price) * price_elasticity
+      - Track competitor price actions if configured
+
+  - name: distribution-generator
+    agent: builder
+    depends_on: [distribution-config]
+    description: |
+      Build demantiq/generators/distribution_generator.py:
+      - generate_distribution(config: DistributionConfig, n_periods: int, rng) -> DistributionResult
+      - DistributionResult: distribution (ndarray 0-1), stockout_mask (ndarray[bool])
+      - Trajectory types: stable (constant), growing (logistic growth), declining (exponential decay),
+        step_change (discrete jump at specified period), custom (user-provided array)
+      - Stockout events: random with configurable probability, reduces demand by stockout_demand_loss
+      - Distribution cap: f(distribution) that scales media-driven demand
+
+  - name: integrate-kernel
+    agent: builder
+    depends_on: [pricing-engine, distribution-generator]
+    description: |
+      Update demantiq/core/demand_kernel.py to add steps 8-9, 14-15:
+      - Step 8: Compute price effect (pricing_engine)
+      - Step 9: Apply distribution cap (distribution_generator)
+      - Step 14: Revenue = outcome * price
+      - Step 15: Margin = revenue - (outcome * COGS) - total_media_cost
+      - Add pricing/distribution columns to observable_data
+      - Add true_price_effect, true_distribution_effect to ground_truth
+      - Add true_price_elasticity, true_margin_decomposition to summary_truth
+
+  - name: ground-truth-updates
+    agent: builder
+    depends_on: [integrate-kernel]
+    description: |
+      Build/update demantiq/ground_truth/:
+      - margin_attribution.py: True margin decomposition per channel per period
+      - elasticities.py: True price elasticity (may be time-varying if seasonal interaction)
+      - Update contributions.py to include price and distribution effects
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [ground-truth-updates]
+    description: |
+      Write tests:
+      - test_config/test_pricing_config.py: Validation, defaults, serialization
+      - test_config/test_distribution_config.py: Validation, defaults, serialization
+      - test_generators/test_pricing_engine.py:
+        - Promo calendar generation matches frequency
+        - Price effect has correct sign (negative elasticity -> higher price reduces demand)
+        - Revenue = outcome * price
+      - test_generators/test_distribution_generator.py:
+        - Distribution stays in [0, 1]
+        - Trajectories match expected shape (growing -> increasing)
+        - Stockouts reduce demand correctly
+      - test_core/test_demand_kernel_m2.py:
+        - Full pipeline with pricing produces valid revenue/margin columns
+        - Margin decomposition is internally consistent
+      - test_integration/test_scn004_pricing_dominant.py: SCN-004 acceptance
+      - test_integration/test_scn011_promotional_trap.py: SCN-011 acceptance
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/ -v --tb=short
+      Verify: SCN-004 and SCN-011 produce valid output
+      Verify: margin decomposition sums correctly
+      Verify: no regressions in M1 tests

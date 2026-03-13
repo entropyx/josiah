@@ -1,0 +1,129 @@
+# Milestone 5: Scenario Library + Monte Carlo
+# All 15 named scenarios, Monte Carlo runner, parallel execution.
+
+name: m5-scenarios-mc
+description: Build scenario library with 15 named scenarios and Monte Carlo orchestration
+depends_on: [m4-interactions]
+
+tasks:
+  - name: difficulty-scorer
+    agent: builder
+    description: |
+      Build demantiq/scenarios/difficulty_scorer.py:
+      - score_difficulty(config: SimulationConfig) -> float (0.0-1.0)
+      - Weighted factors (from PRD FR-SCN-002):
+        - Collinearity (0.20): Average pairwise |rho| across channel spend
+        - Endogeneity (0.20): endogeneity.overall_strength
+        - Signal-to-noise (0.15): Inverse of SNR
+        - Data length (0.15): Inverse of n_periods (normalized, shorter=harder)
+        - Number of channels (0.10): n_channels / 20
+        - Interaction complexity (0.10): non-zero interactions / total possible
+        - Structural breaks (0.10): number and magnitude of regime changes
+
+  - name: scenario-library
+    agent: builder
+    depends_on: [difficulty-scorer]
+    description: |
+      Build demantiq/scenarios/scenario_library.py:
+      - ScenarioLibrary class with class methods:
+        - get(name: str) -> SimulationConfig
+        - list_all() -> list[str]
+        - get_with_metadata(name: str) -> dict (config + description + difficulty)
+      - Implement all 15 scenarios from PRD FR-SCN-001:
+        SCN-001 Clean Room: No endogeneity, low noise, orthogonal spend, 156 weeks, 5 channels
+        SCN-002 Real World: Moderate endogeneity (0.3), correlated spend (rho=0.4), seasonal confounding, 104 weeks, 8 channels
+        SCN-003 Adversarial: High endogeneity (0.7), heavy collinearity (rho=0.8), structural break, low SNR, 52 weeks, 12 channels
+        SCN-004 Pricing Dominant: 60% revenue variation from pricing, media contributes 8%
+        SCN-005 Interaction Heavy: Large price*media (+25%) and distribution*media (+30%)
+        SCN-006 Short Data: 26-52 weeks, moderate complexity
+        SCN-007 Many Channels: 15-20 channels, moderate collinearity, 104 weeks
+        SCN-008 Regime Shift: COVID-like break at week 78, baseline drops 40%, 2 channels go dark
+        SCN-009 New Brand: Rapid distribution growth, increasing baseline, 52 weeks
+        SCN-010 Mature Market: Most channels near saturation, small incremental returns
+        SCN-011 Promotional Trap: Heavy promo calendar correlated with media flights
+        SCN-012 Platform Bias: High algorithmic_targeting_bias
+        SCN-013 Competitor Entry: New competitor at week 60, SOV doubles
+        SCN-014 DTC Pure Play: No distribution variable, high Search/Social, daily granularity
+        SCN-015 Omnichannel Retail: Retail+DTC+Marketplace, distribution, 20 channels, all interactions
+
+  - name: scenario-sampler
+    agent: builder
+    description: |
+      Build demantiq/scenarios/scenario_sampler.py:
+      - ScenarioSampler class:
+        - __init__(parameter_distributions: dict) — each param maps to a distribution spec
+        - generate(n: int, seed: int) -> list[SimulationConfig]
+      - Distribution specs (use scipy.stats internally):
+        - UniformInt(low, high)
+        - Uniform(low, high)
+        - Choice(options)
+        - LogNormal(mu, sigma)
+        - Bernoulli(p)
+        - Poisson(lam)
+      - Default "realistic" preset matching PRD FR-SCN-003 example:
+        n_channels=UniformInt(3,20), n_periods=Choice([26,52,78,104,156]),
+        endogeneity_strength=Uniform(0,0.8), collinearity=Uniform(0,0.9),
+        snr=LogNormal(1.0,0.5), saturation_type=Choice([hill,logistic,power]),
+        adstock_type=Choice([geometric,weibull]), has_pricing=Bernoulli(0.7),
+        has_distribution=Bernoulli(0.5), has_competition=Bernoulli(0.6),
+        n_interactions=Poisson(3), n_regime_changes=Poisson(0.5)
+
+  - name: monte-carlo-runner
+    agent: builder
+    description: |
+      Build demantiq/orchestration/monte_carlo.py:
+      - MonteCarloRunner class:
+        - __init__(scenarios: list[SimulationConfig], n_seeds_per_scenario: int = 10)
+        - run(parallel: bool = True, n_workers: int = None) -> MonteCarloResults
+        - Uses ProcessPoolExecutor for parallelism
+        - Progress tracking via callback or iterator protocol
+      - MonteCarloResults:
+        - results: list[SimulationResult]
+        - scenarios: list[SimulationConfig]
+        - summary() -> DataFrame (one row per scenario*seed)
+        - to_parquet(path)
+
+  - name: parallel-runner
+    agent: builder
+    description: |
+      Build demantiq/orchestration/parallel_runner.py:
+      - run_parallel(configs: list[SimulationConfig], n_workers: int) -> list[SimulationResult]
+      - Uses concurrent.futures.ProcessPoolExecutor
+      - Handles serialization of configs across processes
+      - Error handling: individual failures don't crash the batch
+      - Progress reporting via callback
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [scenario-library, scenario-sampler, monte-carlo-runner, parallel-runner]
+    description: |
+      Write tests:
+      - test_scenarios/test_scenario_library.py:
+        - All 15 scenarios loadable
+        - Each produces valid SimulationConfig
+        - Each generates valid output when run through Simulator
+        - Difficulty scores ordered: Clean Room < Real World < Adversarial
+      - test_scenarios/test_scenario_sampler.py:
+        - Generates requested number of configs
+        - Deterministic with same seed
+        - Parameter distributions match specs
+      - test_scenarios/test_difficulty_scorer.py:
+        - Clean Room scores low, Adversarial scores high
+        - All factors contribute correctly
+      - test_orchestration/test_monte_carlo.py:
+        - Batch run produces correct number of results
+        - Parallel matches sequential results (deterministic seeds)
+      - test_integration/test_all_scenarios.py:
+        - Run all 15 scenarios, verify valid output (no NaN, correct columns, positive demand)
+      - test_integration/test_batch_performance.py:
+        - 1000 simulations complete in reasonable time (benchmark, not hard gate)
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/ -v --tb=short
+      Verify: all 15 scenarios generate valid output
+      Verify: 10,000 simulations complete (benchmark timing)
+      Verify: difficulty scores correctly rank scenarios
+      Verify: no regressions

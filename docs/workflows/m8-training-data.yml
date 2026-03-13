@@ -1,0 +1,58 @@
+# Milestone 8: Training Data Pipeline (API-only)
+# Pipeline producing 1M+ training tuples for neural density estimator.
+
+name: m8-training-data
+description: Build streaming data generation pipeline for large-scale training data production
+depends_on: [m5-scenarios-mc]
+
+tasks:
+  - name: training-format
+    agent: builder
+    description: |
+      Define and implement the training data tuple format:
+      - Each tuple contains:
+        - config_vector: Flattened SimulationConfig as numeric vector (for conditioning)
+        - observable_data: DataFrame compressed to numpy arrays
+        - ground_truth_summary: Flattened summary truth as numeric vector (labels)
+      - Serialization format: compressed numpy archives (.npz) in batches
+      - Batch size: configurable (default 1000 tuples per file)
+      - File naming: batch_{batch_id}_{n_tuples}.npz
+      - Metadata sidecar: JSON with schema version, generation timestamp, sampler config
+
+  - name: streaming-pipeline
+    agent: builder
+    depends_on: [training-format]
+    description: |
+      Build demantiq/orchestration/training_pipeline.py:
+      - TrainingPipeline class:
+        - __init__(sampler: ScenarioSampler, output_dir: str, batch_size: int = 1000)
+        - generate(n_total: int, n_workers: int = 8, seed: int = 42)
+        - Streaming: generates and writes in chunks, does not hold all data in memory
+        - Uses parallel_runner for multi-core generation
+        - Progress tracking: logs batches completed, estimated time remaining
+        - Resumable: tracks which batches are complete, skips on restart
+        - Error handling: failed simulations logged and skipped, not fatal
+
+  - name: write-tests
+    agent: test-writer
+    depends_on: [streaming-pipeline]
+    description: |
+      Write tests:
+      - test_orchestration/test_training_pipeline.py:
+        - Small batch (100 tuples) generates valid output
+        - Output files are valid .npz archives
+        - Metadata sidecar is valid JSON
+        - Config vectors have consistent dimensionality
+        - Ground truth vectors have consistent dimensionality
+        - Resumability: interrupted pipeline can resume
+      - test_orchestration/test_training_format.py:
+        - Round-trip: config -> vector -> config preserves values
+        - Compression ratio is reasonable
+
+  - name: validate
+    agent: validator
+    depends_on: [write-tests]
+    description: |
+      Run: pytest tests/demantiq/test_orchestration/ -v --tb=short
+      Verify: pipeline generates valid training tuples
+      Verify: format is consumable (load .npz, verify shapes)
