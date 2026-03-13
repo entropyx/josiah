@@ -9,6 +9,8 @@ from demantiq.config.baseline_config import BaselineConfig
 from demantiq.config.noise_config import NoiseConfig
 from demantiq.config.interaction_config import InteractionConfig, CustomInteraction
 from demantiq.core.demand_kernel import SimulationResult, simulate
+from demantiq.scenarios.scenario_library import ScenarioLibrary
+from demantiq.orchestration.monte_carlo import MonteCarloRunner
 
 
 class Simulator:
@@ -40,4 +42,6 @@ __all__ = [
     "InteractionConfig",
     "CustomInteraction",
     "SimulationResult",
+    "ScenarioLibrary",
+    "MonteCarloRunner",
 ]
