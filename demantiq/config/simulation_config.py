@@ -71,6 +71,32 @@ class SimulationConfig:
         channels = [ChannelConfig.from_dict(c) for c in d.get("channels", [])]
         noise = NoiseConfig.from_dict(d["noise"]) if "noise" in d else NoiseConfig()
         baseline = BaselineConfig.from_dict(d["baseline"]) if "baseline" in d else BaselineConfig()
+
+        pricing = None
+        if "pricing" in d:
+            from demantiq.config.pricing_config import PricingConfig
+            pricing = PricingConfig.from_dict(d["pricing"])
+
+        distribution = None
+        if "distribution" in d:
+            from demantiq.config.distribution_config import DistributionConfig
+            distribution = DistributionConfig.from_dict(d["distribution"])
+
+        endogeneity = None
+        if "endogeneity" in d:
+            from demantiq.config.endogeneity_config import EndogeneityConfig
+            endogeneity = EndogeneityConfig.from_dict(d["endogeneity"])
+
+        competition = None
+        if "competition" in d:
+            from demantiq.config.competition_config import CompetitionConfig
+            competition = CompetitionConfig.from_dict(d["competition"])
+
+        macro = None
+        if "macro" in d:
+            from demantiq.config.macro_config import MacroConfig
+            macro = MacroConfig.from_dict(d["macro"])
+
         return cls(
             n_periods=d.get("n_periods", 104),
             granularity=d.get("granularity", "weekly"),
@@ -79,4 +105,9 @@ class SimulationConfig:
             baseline=baseline,
             seed=d.get("seed", 42),
             metadata=d.get("metadata", {}),
+            pricing=pricing,
+            distribution=distribution,
+            endogeneity=endogeneity,
+            competition=competition,
+            macro=macro,
         )
