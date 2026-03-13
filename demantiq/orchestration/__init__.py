@@ -3,3 +3,4 @@ from demantiq.orchestration.serializer import (
 )
 from demantiq.orchestration.monte_carlo import MonteCarloRunner, MonteCarloResults
 from demantiq.orchestration.parallel_runner import run_parallel
+from demantiq.orchestration.training_pipeline import TrainingPipeline
