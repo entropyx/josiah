@@ -7,22 +7,24 @@ M1 (Core DGP)
 ├── M2 (Pricing + Distribution)    ─┐
 ├── M3 (Endogeneity + Competition) ─┼── M4 (Interactions)
 │                                    │     └── M5 (Scenarios + Monte Carlo)
-│                                    │           └── M6 (Evaluation)
-│                                    │                 └── M7 (Calibration)
-│                                    │                       └── M8 (Training Data)
+│                                    │           ├── M6 (Evaluation)
+│                                    │           ├── M7 (Calibration)
+│                                    │           └── M8 (Training Data)
 └── Streamlit UI (incremental)
 ```
 
 ## Status
 
-| Milestone | Status | Dependencies | Acceptance |
-|-----------|--------|--------------|------------|
-| M1: Core DGP | pending | none | SCN-001 valid, OLS recovers betas within 5% |
-| M2: Pricing + Distribution | pending | M1 | SCN-004, SCN-011 valid |
-| M3: Endogeneity + Competition | pending | M1 | SCN-003 bias matches analytical within 10% |
-| M4: Interactions | pending | M2, M3 | SCN-005 valid, interaction magnitudes correct |
-| M5: Scenarios + Monte Carlo | pending | M4 | 15 scenarios valid, 10k sims < 60 min |
-| M6: Evaluation | pending | M5 | Head-to-head comparison produces structured results |
-| M7: Calibration | pending | M5 | Realism validator passes on all scenarios |
-| M8: Training Data | pending | M5 | 1M+ tuples generated |
-| UI: Streamlit pages | pending | incremental | All pages render without errors |
+| Milestone | Status | Tests | Commit |
+|-----------|--------|-------|--------|
+| M1: Core DGP | **done** | 104 | `07b933e` |
+| M2: Pricing + Distribution | **done** | +53 | `452229f` |
+| M3: Endogeneity + Competition | **done** | (with M2) | `452229f` |
+| M4: Interactions | **done** | +29 | `5f07884` |
+| M5: Scenarios + Monte Carlo | **done** | +60 | `270301c` |
+| M6: Evaluation | **done** | +68 | `5c4e3be` |
+| M7: Calibration | **done** | +11 | `5c4e3be` |
+| M8: Training Data | **done** | +22 | `15c136a` |
+| UI: Streamlit pages | **done** | — | `5aaac59` |
+
+**Total tests: 416**
