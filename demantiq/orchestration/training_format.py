@@ -34,6 +34,30 @@ _PER_CHANNEL_TRUTH_LEN = 3
 _GLOBAL_TRUTH_LEN = 2
 TRUTH_VECTOR_LEN = _GLOBAL_TRUTH_LEN + MAX_CHANNELS * _PER_CHANNEL_TRUTH_LEN
 
+# --- Extended truth vector for neural inference engine ---
+# Per-channel extended truth: beta(1) + roas(1) + contribution(1) + contribution_frac(1)
+#   + sat_fn(1) + sat_params(4) + ads_fn(1) + ads_params(3)
+#   + price_x_media(1) + distribution_x_media(1) = 15
+_PER_CHANNEL_EXT_TRUTH_LEN = 15
+# Global extended truth: total_media_contribution_pct(1) + price_elasticity(1) = 2
+_GLOBAL_EXT_TRUTH_LEN = 2
+EXT_TRUTH_VECTOR_LEN = _GLOBAL_EXT_TRUTH_LEN + MAX_CHANNELS * _PER_CHANNEL_EXT_TRUTH_LEN
+
+# --- Business context variables (observable, not inferred) ---
+# Fixed-width context matrix with columns for all business variables.
+# Absent variables are zero-filled. Order matters for the neural encoder.
+CONTEXT_COLUMNS = [
+    "price",            # 0: product price (if pricing configured)
+    "is_promo",         # 1: binary promotion indicator
+    "promo_depth",      # 2: promotion discount depth
+    "distribution",     # 3: weighted distribution % (if distribution configured)
+    "stockout",         # 4: binary stockout indicator
+    "competitor_sov",   # 5: competitor share of voice (if competition configured)
+]
+# Macro variables are dynamic (0-N), appended after fixed columns
+MAX_MACRO_VARS = 4  # cap on macro variables
+MAX_CONTEXT_COLS = len(CONTEXT_COLUMNS) + MAX_MACRO_VARS  # 10 total
+
 
 def config_to_vector(config: SimulationConfig) -> np.ndarray:
     """Flatten SimulationConfig to a fixed-length numeric vector.
@@ -182,6 +206,144 @@ def vector_to_summary(vector: np.ndarray, channel_names: list[str]) -> dict:
     return summary
 
 
+def summary_to_ext_vector(summary: dict, config: SimulationConfig) -> np.ndarray:
+    """Flatten summary truth dict to an extended truth vector for neural inference.
+
+    Includes per-channel saturation/adstock params and contribution fractions
+    alongside betas, ROAS, and total contributions.
+
+    Args:
+        summary: Summary truth dict from simulation.
+        config: SimulationConfig used to generate the summary (for curve params).
+
+    Returns:
+        np.ndarray of shape (EXT_TRUTH_VECTOR_LEN,).
+    """
+    vec = np.zeros(EXT_TRUTH_VECTOR_LEN, dtype=np.float64)
+
+    # Global truth
+    vec[0] = summary.get("true_total_media_contribution_pct", 0.0)
+    vec[1] = summary.get("true_price_elasticity", 0.0)
+
+    # Compute total y for contribution fractions
+    true_contrib = summary.get("true_total_contribution", {})
+    total_contrib = sum(true_contrib.values()) if true_contrib else 0.0
+
+    # Per-channel extended truth
+    true_betas = summary.get("true_betas", {})
+    true_roas = summary.get("true_roas", {})
+
+    for i, ch in enumerate(config.channels):
+        if i >= MAX_CHANNELS:
+            break
+        offset = _GLOBAL_EXT_TRUTH_LEN + i * _PER_CHANNEL_EXT_TRUTH_LEN
+
+        # Core metrics
+        vec[offset + 0] = true_betas.get(ch.name, 0.0)
+        vec[offset + 1] = true_roas.get(ch.name, 0.0)
+        vec[offset + 2] = true_contrib.get(ch.name, 0.0)
+        # Contribution fraction (normalized)
+        if total_contrib > 0:
+            vec[offset + 3] = true_contrib.get(ch.name, 0.0) / total_contrib
+        else:
+            vec[offset + 3] = 0.0
+
+        # Saturation function and params
+        vec[offset + 4] = _SAT_FN_MAP.get(ch.saturation_fn, 0)
+        sat_vals = _encode_saturation_params(ch.saturation_fn, ch.saturation_params)
+        vec[offset + 5: offset + 9] = sat_vals
+
+        # Adstock function and params
+        vec[offset + 9] = _ADS_FN_MAP.get(ch.adstock_fn, 0)
+        ads_vals = _encode_adstock_params(ch.adstock_fn, ch.adstock_params)
+        vec[offset + 10: offset + 13] = ads_vals
+
+        # Interaction coefficients (from config, 0.0 if no interactions)
+        if config.interactions is not None:
+            vec[offset + 13] = config.interactions.price_x_media.get(ch.name, 0.0)
+            vec[offset + 14] = config.interactions.distribution_x_media.get(ch.name, 0.0)
+
+    return vec
+
+
+def ext_vector_to_summary(vector: np.ndarray, channel_names: list[str]) -> dict:
+    """Inverse of summary_to_ext_vector for verification.
+
+    Args:
+        vector: Extended truth vector of shape (EXT_TRUTH_VECTOR_LEN,).
+        channel_names: Ordered list of channel names.
+
+    Returns:
+        Dict with reconstructed summary fields including curve params.
+    """
+    _SAT_FN_INV = {v: k for k, v in _SAT_FN_MAP.items()}
+    _ADS_FN_INV = {v: k for k, v in _ADS_FN_MAP.items()}
+
+    summary: dict = {
+        "true_total_media_contribution_pct": float(vector[0]),
+        "true_price_elasticity": float(vector[1]),
+        "true_betas": {},
+        "true_roas": {},
+        "true_total_contribution": {},
+        "true_contribution_fractions": {},
+        "true_saturation_fns": {},
+        "true_saturation_params": {},
+        "true_adstock_fns": {},
+        "true_adstock_params": {},
+        "true_price_x_media": {},
+        "true_distribution_x_media": {},
+    }
+
+    for i, name in enumerate(channel_names):
+        if i >= MAX_CHANNELS:
+            break
+        offset = _GLOBAL_EXT_TRUTH_LEN + i * _PER_CHANNEL_EXT_TRUTH_LEN
+
+        summary["true_betas"][name] = float(vector[offset + 0])
+        summary["true_roas"][name] = float(vector[offset + 1])
+        summary["true_total_contribution"][name] = float(vector[offset + 2])
+        summary["true_contribution_fractions"][name] = float(vector[offset + 3])
+        summary["true_saturation_fns"][name] = _SAT_FN_INV.get(int(vector[offset + 4]), "hill")
+        summary["true_saturation_params"][name] = vector[offset + 5: offset + 9].tolist()
+        summary["true_adstock_fns"][name] = _ADS_FN_INV.get(int(vector[offset + 9]), "geometric")
+        summary["true_adstock_params"][name] = vector[offset + 10: offset + 13].tolist()
+        summary["true_price_x_media"][name] = float(vector[offset + 13])
+        summary["true_distribution_x_media"][name] = float(vector[offset + 14])
+
+    return summary
+
+
+def extract_context_matrix(observable_data, n_periods: int) -> np.ndarray:
+    """Extract business context variables from observable data into a fixed-width matrix.
+
+    Columns: price, is_promo, promo_depth, distribution, stockout, competitor_sov,
+    then up to MAX_MACRO_VARS macro variables. Missing columns are zero-filled.
+
+    Args:
+        observable_data: DataFrame from SimulationResult.observable_data.
+        n_periods: Number of time periods.
+
+    Returns:
+        np.ndarray of shape (n_periods, MAX_CONTEXT_COLS).
+    """
+    ctx = np.zeros((n_periods, MAX_CONTEXT_COLS), dtype=np.float64)
+
+    for i, col_name in enumerate(CONTEXT_COLUMNS):
+        if col_name in observable_data.columns:
+            ctx[:, i] = observable_data[col_name].values[:n_periods]
+
+    # Macro variables: any column not in known set
+    known_cols = set(CONTEXT_COLUMNS) | {"date", "y", "revenue"}
+    # Also exclude spend columns
+    known_cols |= {c for c in observable_data.columns if c.endswith("_spend")}
+    macro_cols = [c for c in observable_data.columns if c not in known_cols]
+
+    for j, col_name in enumerate(macro_cols[:MAX_MACRO_VARS]):
+        ctx[:, len(CONTEXT_COLUMNS) + j] = observable_data[col_name].values[:n_periods]
+
+    return ctx
+
+
 def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
     """Save a batch of training tuples to a compressed .npz file.
 
@@ -221,15 +383,37 @@ def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
         if sm.ndim == 2 and sm.shape[1] > 0:
             spend_batch[i, :n_t, :sm.shape[1]] = sm
 
+    # Build extended truth vectors if present
+    has_ext_truth = "ext_truth_vector" in tuples[0]
+    ext_truth_vectors = None
+    if has_ext_truth:
+        ext_truth_vectors = np.stack([t["ext_truth_vector"] for t in tuples])
+
+    # Build context matrix if present
+    has_context = "context_matrix" in tuples[0]
+    context_batch = None
+    if has_context:
+        context_batch = np.zeros(
+            (n_samples, max_periods, MAX_CONTEXT_COLS), dtype=np.float64
+        )
+        for i, t in enumerate(tuples):
+            cm = t["context_matrix"]
+            n_t = cm.shape[0]
+            context_batch[i, :n_t, :] = cm
+
     # Save arrays
     npz_path = out / f"batch_{batch_id}.npz"
-    np.savez_compressed(
-        str(npz_path),
+    save_kwargs = dict(
         config_vectors=config_vectors,
         truth_vectors=truth_vectors,
         y=y_batch,
         spend=spend_batch,
     )
+    if ext_truth_vectors is not None:
+        save_kwargs["ext_truth_vectors"] = ext_truth_vectors
+    if context_batch is not None:
+        save_kwargs["context"] = context_batch
+    np.savez_compressed(str(npz_path), **save_kwargs)
 
     # Save metadata sidecar
     metadata = {

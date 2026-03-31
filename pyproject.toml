@@ -29,6 +29,12 @@ test = [
     "scipy>=1.9.0",
     "pyyaml>=6.0",
 ]
+neural = [
+    "torch>=2.0",
+    "sbi>=0.23",
+    "zuko>=1.0",
+    "arviz>=0.15",
+]
 
 [tool.setuptools.packages.find]
 include = ["josiah*", "demantiq*"]

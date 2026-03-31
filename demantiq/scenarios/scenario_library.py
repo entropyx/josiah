@@ -62,6 +62,7 @@ class ScenarioLibrary:
             "interaction_heavy", "short_data", "many_channels", "regime_shift",
             "new_brand", "mature_market", "promotional_trap", "platform_bias",
             "competitor_entry", "dtc_pure_play", "omnichannel_retail",
+            "realistic_brand",
         ]
 
     @classmethod
@@ -478,5 +479,88 @@ class ScenarioLibrary:
             interactions=InteractionConfig(
                 price_x_media={n: 0.10 for n in ch_names[:5]},
                 distribution_x_media={n: 0.15 for n in ch_names[:5]},
+            ),
+        )
+
+    # ── SCN-016 Realistic Brand ────────────────────────────────────────
+
+    @classmethod
+    def realistic_brand(cls) -> SimulationConfig:
+        """5 differentiated channels with pricing, distribution, and interactions.
+
+        A realistic DTC/retail brand with:
+        - Facebook: high spend, strong beta, fast adstock (digital)
+        - Google: highest beta (search intent), moderate spend
+        - TikTok: low spend, moderate beta, pulsed campaigns
+        - Email: low spend, high beta (owned channel), always-on
+        - YouTube: high spend, moderate beta, slow adstock (video/brand)
+
+        Each channel has different saturation curves, adstock shapes,
+        spend levels, and interaction strengths — mimicking a real business.
+        """
+        channels = [
+            _channel("facebook", beta=180.0, group="social",
+                     sat_fn="logistic", sat_params={"k": 4.0, "x0": 0.5},
+                     ads_fn="geometric", ads_params={"alpha": 0.3, "max_lag": 6},
+                     spend_mean=25000.0, spend_std=8000.0,
+                     spend_pattern="always_on"),
+            _channel("google", beta=350.0, group="search",
+                     sat_fn="hill", sat_params={"K": 0.4, "S": 2.5},
+                     ads_fn="geometric", ads_params={"alpha": 0.2, "max_lag": 4},
+                     spend_mean=20000.0, spend_std=5000.0,
+                     spend_pattern="always_on"),
+            _channel("tiktok", beta=120.0, group="social",
+                     sat_fn="logistic", sat_params={"k": 6.0, "x0": 0.4},
+                     ads_fn="geometric", ads_params={"alpha": 0.4, "max_lag": 5},
+                     spend_mean=8000.0, spend_std=6000.0,
+                     spend_pattern="pulsed"),
+            _channel("email", beta=280.0, group="owned",
+                     sat_fn="hill", sat_params={"K": 0.6, "S": 1.5},
+                     ads_fn="geometric", ads_params={"alpha": 0.1, "max_lag": 3},
+                     spend_mean=3000.0, spend_std=1000.0,
+                     spend_pattern="always_on"),
+            _channel("youtube", beta=200.0, group="video",
+                     sat_fn="hill", sat_params={"K": 0.5, "S": 2.0},
+                     ads_fn="weibull_cdf", ads_params={"shape": 2.0, "scale": 3.0, "max_lag": 10},
+                     spend_mean=30000.0, spend_std=10000.0,
+                     spend_pattern="seasonal"),
+        ]
+        return SimulationConfig(
+            n_periods=104,
+            channels=channels,
+            noise=NoiseConfig(noise_scale=25.0),
+            baseline=BaselineConfig(
+                organic_level=1200.0,
+                trend_type="linear",
+                trend_params={"slope": 2.0},
+                seasonality_n_terms=2,
+            ),
+            seed=2001,
+            metadata={"scenario": "SCN-016", "name": "realistic_brand"},
+            pricing=PricingConfig(
+                base_price=45.0,
+                price_elasticity=-1.2,
+                promo_frequency="monthly",
+                promo_depth_mean=0.20,
+            ),
+            distribution=DistributionConfig(
+                initial_distribution=0.75,
+                distribution_trajectory="growing",
+            ),
+            interactions=InteractionConfig(
+                price_x_media={
+                    "facebook": 0.20,   # promos boost social ads
+                    "google": 0.10,     # search less affected by promos
+                    "tiktok": 0.25,     # promos amplify viral content
+                    "email": 0.30,      # promo emails very effective
+                    "youtube": 0.05,    # video barely affected by promos
+                },
+                distribution_x_media={
+                    "facebook": 0.15,
+                    "google": 0.20,     # search converts where product available
+                    "tiktok": 0.10,
+                    "email": 0.25,      # email drives store visits
+                    "youtube": 0.15,
+                },
             ),
         )

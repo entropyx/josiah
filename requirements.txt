@@ -3,3 +3,15 @@ numpy>=1.20.0
 matplotlib>=3.0.0
 plotly>=5.0.0
 streamlit>=1.20.0
+pyyaml>=6.0
+scipy
+
+# Neural inference engine
+torch>=2.0
+sbi>=0.23
+zuko>=1.0
+arviz>=0.15
+
+# Testing
+pytest>=7.0
+hypothesis>=6.0

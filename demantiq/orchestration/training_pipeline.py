@@ -54,8 +54,10 @@ class TrainingPipeline:
         from demantiq.orchestration.parallel_runner import run_parallel
         from demantiq.orchestration.training_format import (
             config_to_vector,
+            extract_context_matrix,
             save_batch,
             summary_to_vector,
+            summary_to_ext_vector,
         )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -73,7 +75,12 @@ class TrainingPipeline:
             n_in_batch = min(self.batch_size, n_total - batch_id * self.batch_size)
 
             # Generate configs using a fresh sampler seeded per batch
-            batch_sampler = ScenarioSampler(seed=batch_seed)
+            # Preserve rich_context and n_fixed_channels from the parent sampler
+            batch_sampler = ScenarioSampler(
+                seed=batch_seed,
+                rich_context=self.sampler.rich_context,
+                n_fixed_channels=self.sampler.n_fixed_channels,
+            )
             configs = batch_sampler.sample(n_in_batch)
 
             # Run simulations in parallel
@@ -104,7 +111,13 @@ class TrainingPipeline:
                         "config_vector": config_to_vector(config),
                         "y": result.observable_data["y"].values,
                         "spend_matrix": spend_matrix,
+                        "context_matrix": extract_context_matrix(
+                            result.observable_data, config.n_periods
+                        ),
                         "truth_vector": summary_to_vector(result.summary_truth),
+                        "ext_truth_vector": summary_to_ext_vector(
+                            result.summary_truth, config
+                        ),
                         "channel_names": channel_names,
                     }
                 )

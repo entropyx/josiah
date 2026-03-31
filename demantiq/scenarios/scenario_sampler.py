@@ -35,8 +35,10 @@ class ScenarioSampler:
         seed: Master seed for reproducibility.
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, rich_context: bool = False, n_fixed_channels: int | None = None):
         self.rng = np.random.default_rng(seed)
+        self.rich_context = rich_context
+        self.n_fixed_channels = n_fixed_channels
 
     def sample(self, n: int = 1) -> list[SimulationConfig]:
         """Generate n random SimulationConfigs.
@@ -57,8 +59,11 @@ class ScenarioSampler:
         """Sample a single random SimulationConfig."""
         rng = self.rng
 
-        # Number of channels: 2-15
-        n_channels = int(rng.integers(2, 16))
+        # Number of channels: fixed or random 2-15
+        if self.n_fixed_channels is not None:
+            n_channels = self.n_fixed_channels
+        else:
+            n_channels = int(rng.integers(2, 16))
         channel_names = list(rng.choice(_CHANNEL_NAMES, size=n_channels, replace=False))
 
         # Number of correlation groups: 1 to n_channels
@@ -112,9 +117,19 @@ class ScenarioSampler:
             seasonality_n_terms=int(rng.integers(1, 5)),
         )
 
-        # Optional configs (each with ~40% chance)
+        # Optional configs — probabilities depend on rich_context mode
+        # rich_context=True ensures ~39% of samples have full business context
+        # (pricing + distribution + interactions), vs ~3.6% in default mode
+        p_pricing = 1.0 if self.rich_context else 0.4
+        p_distribution = 0.7 if self.rich_context else 0.3
+        p_endogeneity = 0.5 if self.rich_context else 0.4
+        p_competition = 0.5 if self.rich_context else 0.3
+        p_macro = 0.4 if self.rich_context else 0.25
+        p_interactions = 0.7 if self.rich_context else 0.3
+        p_per_channel_interaction = 0.8 if self.rich_context else 0.5
+
         pricing = None
-        if rng.random() < 0.4:
+        if rng.random() < p_pricing:
             pricing = PricingConfig(
                 base_price=float(rng.uniform(10.0, 100.0)),
                 price_elasticity=float(rng.uniform(-3.0, -0.5)),
@@ -123,14 +138,14 @@ class ScenarioSampler:
             )
 
         distribution = None
-        if rng.random() < 0.3:
+        if rng.random() < p_distribution:
             distribution = DistributionConfig(
                 initial_distribution=float(rng.uniform(0.2, 1.0)),
                 distribution_trajectory=str(rng.choice(["stable", "growing", "declining"])),
             )
 
         endogeneity = None
-        if rng.random() < 0.4:
+        if rng.random() < p_endogeneity:
             endogeneity = EndogeneityConfig(
                 overall_strength=float(rng.uniform(0.05, 0.8)),
                 performance_chasing=float(rng.uniform(0.0, 0.5)),
@@ -138,7 +153,7 @@ class ScenarioSampler:
             )
 
         competition = None
-        if rng.random() < 0.3:
+        if rng.random() < p_competition:
             competition = CompetitionConfig(
                 n_competitors=int(rng.integers(1, 6)),
                 competitor_sov_mean=float(rng.uniform(0.1, 0.5)),
@@ -146,7 +161,7 @@ class ScenarioSampler:
             )
 
         macro = None
-        if rng.random() < 0.25:
+        if rng.random() < p_macro:
             n_regime = int(rng.integers(0, 3))
             changes = [
                 RegimeChange(
@@ -159,11 +174,21 @@ class ScenarioSampler:
             macro = MacroConfig(regime_changes=changes)
 
         interactions = None
-        if pricing is not None and rng.random() < 0.3:
-            interactions = InteractionConfig(
-                price_x_media={ch.name: float(rng.uniform(-0.1, 0.3))
-                               for ch in channels if rng.random() < 0.5},
-            )
+        if pricing is not None and rng.random() < p_interactions:
+            interaction_dict = {}
+            for ch in channels:
+                if rng.random() < p_per_channel_interaction:
+                    interaction_dict[ch.name] = float(rng.uniform(-0.1, 0.3))
+            if interaction_dict:
+                dist_interaction_dict = {}
+                if distribution is not None:
+                    for ch in channels:
+                        if rng.random() < p_per_channel_interaction:
+                            dist_interaction_dict[ch.name] = float(rng.uniform(-0.1, 0.3))
+                interactions = InteractionConfig(
+                    price_x_media=interaction_dict,
+                    distribution_x_media=dist_interaction_dict,
+                )
 
         return SimulationConfig(
             n_periods=n_periods,
