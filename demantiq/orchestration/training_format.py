@@ -2,6 +2,8 @@
 
 Converts SimulationConfig and summary_truth dicts to fixed-length
 numeric vectors, and provides batch save/load for .npz files.
+Also converts per-period ground truth DataFrames into fixed-width
+decomposition matrices for the temporal decoder.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from demantiq.config.simulation_config import SimulationConfig
 
@@ -57,6 +60,28 @@ CONTEXT_COLUMNS = [
 # Macro variables are dynamic (0-N), appended after fixed columns
 MAX_MACRO_VARS = 4  # cap on macro variables
 MAX_CONTEXT_COLS = len(CONTEXT_COLUMNS) + MAX_MACRO_VARS  # 10 total
+
+# --- Per-period decomposition matrix layout ---
+# Fixed-width matrix storing per-period demand component values from ground_truth.
+# Column layout:
+#   0: baseline
+#   1 .. MAX_CHANNELS: per-channel contribution (post-interaction)
+#   MAX_CHANNELS+1: price_effect (additive)
+#   MAX_CHANNELS+2: distribution_cap (multiplicative, raw value ~1.0)
+#   MAX_CHANNELS+3: competition_effect (additive, scaled by mean demand)
+#   MAX_CHANNELS+4: macro_effect (macro + regime combined)
+#   MAX_CHANNELS+5: noise
+DECOMP_N_FIXED = 6  # baseline(1) + price(1) + distribution(1) + competition(1) + macro(1) + noise(1)
+DECOMP_COLS = 1 + MAX_CHANNELS + 5  # baseline + channels + price + dist + competition + macro + noise = 26
+# Named indices for readability
+DECOMP_IDX_BASELINE = 0
+DECOMP_IDX_CHANNELS_START = 1
+DECOMP_IDX_CHANNELS_END = 1 + MAX_CHANNELS  # exclusive
+DECOMP_IDX_PRICE = MAX_CHANNELS + 1
+DECOMP_IDX_DISTRIBUTION = MAX_CHANNELS + 2
+DECOMP_IDX_COMPETITION = MAX_CHANNELS + 3
+DECOMP_IDX_MACRO = MAX_CHANNELS + 4
+DECOMP_IDX_NOISE = MAX_CHANNELS + 5
 
 
 def config_to_vector(config: SimulationConfig) -> np.ndarray:
@@ -344,6 +369,65 @@ def extract_context_matrix(observable_data, n_periods: int) -> np.ndarray:
     return ctx
 
 
+def ground_truth_to_decomposition(
+    ground_truth: pd.DataFrame,
+    channel_names: list[str],
+    n_periods: int,
+) -> np.ndarray:
+    """Convert a per-period ground_truth DataFrame to a fixed-width decomposition matrix.
+
+    Extracts all demand components from the ground_truth DataFrame into a
+    (n_periods, DECOMP_COLS) matrix. Missing components are zero-filled.
+    Channel contributions are placed at their respective indices (1..MAX_CHANNELS).
+
+    Args:
+        ground_truth: DataFrame from SimulationResult.ground_truth with columns like
+            true_baseline, true_{channel}_contribution, true_price_effect, etc.
+        channel_names: Ordered list of channel names matching the config.
+        n_periods: Number of time periods.
+
+    Returns:
+        np.ndarray of shape (n_periods, DECOMP_COLS) with raw component values.
+    """
+    decomp = np.zeros((n_periods, DECOMP_COLS), dtype=np.float64)
+
+    # Baseline
+    if "true_baseline" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_BASELINE] = ground_truth["true_baseline"].values[:n_periods]
+
+    # Per-channel contributions (post-interaction values)
+    for i, ch_name in enumerate(channel_names):
+        if i >= MAX_CHANNELS:
+            break
+        col = f"true_{ch_name}_contribution"
+        if col in ground_truth.columns:
+            decomp[:, DECOMP_IDX_CHANNELS_START + i] = ground_truth[col].values[:n_periods]
+
+    # Price effect (additive)
+    if "true_price_effect" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_PRICE] = ground_truth["true_price_effect"].values[:n_periods]
+
+    # Distribution cap (multiplicative — stored as raw multiplier, typically ~0.8-1.0)
+    if "true_distribution_cap" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_DISTRIBUTION] = ground_truth["true_distribution_cap"].values[:n_periods]
+
+    # Competition effect
+    if "true_competition_effect" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_COMPETITION] = ground_truth["true_competition_effect"].values[:n_periods]
+
+    # Macro + regime effects (combined into one column)
+    if "true_macro_effect" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_MACRO] = ground_truth["true_macro_effect"].values[:n_periods]
+    if "true_regime_effects" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_MACRO] += ground_truth["true_regime_effects"].values[:n_periods]
+
+    # Noise
+    if "true_noise" in ground_truth.columns:
+        decomp[:, DECOMP_IDX_NOISE] = ground_truth["true_noise"].values[:n_periods]
+
+    return decomp
+
+
 def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
     """Save a batch of training tuples to a compressed .npz file.
 
@@ -401,6 +485,18 @@ def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
             n_t = cm.shape[0]
             context_batch[i, :n_t, :] = cm
 
+    # Build decomposition matrix if present
+    has_decomp = "decomposition" in tuples[0]
+    decomp_batch = None
+    if has_decomp:
+        decomp_batch = np.zeros(
+            (n_samples, max_periods, DECOMP_COLS), dtype=np.float64
+        )
+        for i, t in enumerate(tuples):
+            dm = t["decomposition"]
+            n_t = dm.shape[0]
+            decomp_batch[i, :n_t, :] = dm
+
     # Save arrays
     npz_path = out / f"batch_{batch_id}.npz"
     save_kwargs = dict(
@@ -413,6 +509,8 @@ def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
         save_kwargs["ext_truth_vectors"] = ext_truth_vectors
     if context_batch is not None:
         save_kwargs["context"] = context_batch
+    if decomp_batch is not None:
+        save_kwargs["decomposition"] = decomp_batch
     np.savez_compressed(str(npz_path), **save_kwargs)
 
     # Save metadata sidecar

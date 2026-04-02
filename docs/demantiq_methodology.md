@@ -70,6 +70,89 @@ The network has already "seen" thousands of businesses similar to yours. It reco
 
 ## 2. The Simulator (Data Generating Process)
 
+### What the simulator does, in plain English
+
+Imagine you run a supplement brand. Every week you have sales. Those sales come from a bunch of different things happening at the same time. The simulator builds a fake version of your business where we control every lever and know exactly how much each one contributes.
+
+Here's what the simulator calculates, step by step:
+
+**1. Start with organic demand ("people who would buy anyway")**
+
+Every brand has a baseline level of demand — people who already know your product, repeat buyers, organic search traffic. This is the demand you'd get if you turned off all ads, never ran a promo, and the economy stayed flat.
+
+Example: 1,200 units per week as a baseline, growing slowly at +2 units/week (your brand is getting more well-known over time), plus a seasonal bump around the holidays.
+
+**2. Add what each media channel contributes**
+
+For each channel (Facebook, Google, TikTok, Email, YouTube), the simulator computes how much demand that channel's spend generates. But it's not a simple "spend $1, get X sales." Three things happen:
+
+- **Carryover (adstock)**: When you run a Facebook ad on Monday, some people see it and buy Tuesday, Wednesday, next week. The ad's effect lingers and decays over time. Facebook ads decay fast (people forget in a few days). YouTube brand videos decay slowly (awareness sticks around for weeks). The simulator models this: each week's spend contributes not just to this week's sales, but to next week's, and the week after, with a decay rate specific to each channel.
+
+- **Diminishing returns (saturation)**: The first $10K you spend on Facebook reaches new people. The fifth $10K just shows the same people the same ad again. Every channel has a point where spending more stops helping. The simulator models this with a curve that rises steeply at low spend and flattens at high spend. Different channels saturate at different rates — Google Search might saturate slower (there's always someone searching) while TikTok might saturate faster (limited viral reach).
+
+- **Channel strength (beta)**: After applying carryover and saturation, the result is multiplied by a coefficient that represents the channel's actual effectiveness. Google might have beta=350 (search intent is very strong), while TikTok might have beta=120 (awareness but less direct conversion). This is the core number we're trying to recover.
+
+**3. Account for how promotions amplify ads (price × media interaction)**
+
+When you're running a 20% off sale AND Facebook ads at the same time, the ads work better than normal. People see the ad, see the discount, and are more likely to buy. This amplification effect is the price × media interaction.
+
+Each channel has its own interaction strength:
+- Email: 30% amplification during promos (promo emails are very effective)
+- TikTok: 25% (promos boost viral content)
+- Facebook: 20% (social ads + deals work well together)
+- Google: 10% (people searching already have intent, promos help less)
+- YouTube: 5% (brand videos barely affected by whether there's a promo)
+
+**4. Account for how distribution amplifies ads (distribution × media interaction)**
+
+If your product is only in 75% of stores, then ads that drive people to stores are wasted 25% of the time — the customer goes to buy but it's not on the shelf. Higher distribution means ads convert better. This is the distribution × media interaction.
+
+**5. Add the effect of price changes**
+
+When your average selling price goes up 10%, demand drops. How much it drops is the price elasticity. An elasticity of -1.2 means: "10% price increase → 12% demand decrease."
+
+The simulator tracks your product's price each week. During promo weeks (say, 20% off monthly), price drops and demand goes up. During normal weeks, price is at the base level.
+
+**6. Factor in distribution (store availability)**
+
+If your product is only available in 75% of stores, you can only capture 75% of the potential demand that media and pricing generate. Distribution acts as a ceiling — no matter how good your ads are, you can't sell what isn't on the shelf.
+
+The simulator tracks distribution over time. A growing brand might go from 50% → 85% distribution over 2 years as they get into more retailers.
+
+**7. Factor in competition**
+
+Competitors are running their own ads. When competitor share-of-voice is high, your ads stand out less — people see theirs instead of yours. The simulator tracks competitor activity and reduces your media effectiveness proportionally.
+
+**8. Factor in the economy (macro effects)**
+
+Consumer confidence, unemployment, category trends — these affect demand regardless of what you do with media or pricing. A recession suppresses demand even if you triple your ad budget.
+
+The simulator can also model structural breaks — sudden events like a new competitor entering the market or a supply chain shock that permanently shifts the baseline.
+
+**9. Add random noise**
+
+Real sales data is noisy. Weather, viral social posts, a celebrity mention, a bad review — things you can't predict. The simulator adds realistic random noise to make the fake data look like real data.
+
+**10. Sum it all up**
+
+```
+This week's demand = organic baseline
+                   + Facebook contribution (after carryover + saturation + interactions)
+                   + Google contribution
+                   + TikTok contribution
+                   + Email contribution
+                   + YouTube contribution
+                   + price change effect
+                   + distribution effect
+                   + competition effect
+                   + macro/economy effect
+                   + random noise
+```
+
+The simulator knows the EXACT number for each line. In real life you only see the total (your sales report). The neural engine's job is to look at your sales data, your spend data, your prices, your distribution — and figure out what each line was.
+
+---
+
 ### The demand equation
 
 For each time period t (typically weekly, over 26-260 weeks):
@@ -228,6 +311,92 @@ A 10% price increase → ln(1.1) ≈ 0.095 → effect = -1.5 × 0.095 = -0.14 �
 ---
 
 ## 3. The Neural Inference Engine
+
+### How the neural engine works, in plain English
+
+The simulator can generate a fake business where we know everything — every beta, every interaction coefficient, every elasticity. But with a real client, we only see the output (sales) and the inputs (spend, prices, etc.). We don't know the hidden parameters that connect them.
+
+The neural engine solves this by studying thousands of fake businesses, then applying what it learned to real ones. Here's how, step by step:
+
+**Step 1: Create 50,000 practice problems**
+
+We run the simulator 50,000 times, each time with completely different random settings — different channels, different betas, different saturation curves, different price elasticities, different interaction strengths. Each run produces:
+- The observable data: weekly sales, weekly spend per channel, prices, distribution, etc. (this is what a real client would give us)
+- The answer key: the exact betas, ROAS, elasticity, interaction coefficients that generated those sales (this is what we'd never know with real data)
+
+Think of it like a teacher creating 50,000 math tests with answer keys. Each test is a different business.
+
+**Step 2: Teach a neural network to read business data**
+
+The neural network needs to look at 104 weeks of sales data, spend across 5 channels, prices, promotions, and distribution — and extract the important patterns. This is like reading an X-ray: the raw image has millions of pixels, but a trained radiologist sees "tumor, 3cm, left lobe."
+
+We use a **pattern reader** (the embedding network) that works in four steps:
+
+1. **Read each channel's spend pattern separately.** A small neural network (called a dilated CNN — think of it as a sliding magnifying glass that looks at different time scales) scans each channel's weekly spend and produces a summary: "Facebook had pulsed campaigns with peaks in Q4" or "Google was always-on with steady spend." This produces a 64-number fingerprint per channel.
+
+2. **Understand how channels interact with each other.** A cross-channel attention mechanism (called a Set Transformer) looks at all channels together and asks: "Are Facebook and Google spending at the same times? Is TikTok's pulsed pattern offset from YouTube's seasonal pattern?" This captures relationships between channels — are they competing for the same audience or complementing each other? Each channel's fingerprint gets updated with this cross-channel context, and all channels get pooled into a single 80-number summary of the media mix.
+
+3. **Read the business context.** Another pattern reader scans the non-media time series: price changes, promo periods, distribution levels, competitive activity, macro indicators. It produces a 64-number summary of the business environment.
+
+4. **Read the sales pattern.** A third pattern reader scans the sales time series itself — the seasonality, trend, noise level, response to events. Another 64-number summary.
+
+All four summaries get concatenated and compressed into a final **256-number fingerprint** that captures everything important about this business. This fingerprint is what the next step uses.
+
+**Step 3: Turn the fingerprint into parameter estimates**
+
+Now we have a 256-number fingerprint summarizing a business. We need to turn it into estimates of the hidden parameters (betas, ROAS, elasticity, interactions) — with uncertainty.
+
+We use a **Neural Spline Flow** (NSF). Think of it as a machine that takes random noise and reshapes it into a meaningful answer, guided by the fingerprint:
+
+1. Start with pure random noise — 5 random numbers from a bell curve (for per-channel inference: beta, ROAS, contribution fraction, price interaction, distribution interaction)
+2. Pass through 5 "reshaping" steps, each guided by the business fingerprint
+3. Each step bends, stretches, and shifts the numbers based on what the fingerprint says about this business
+4. After 5 steps, the random noise has been transformed into a plausible set of parameters FOR THIS SPECIFIC BUSINESS
+
+Because we start with random noise, we can repeat this 10,000 times and get 10,000 different plausible answers. The spread of those answers IS the uncertainty. If all 10,000 say "Facebook beta is between 160 and 200," we're confident. If they spread from 50 to 400, we're uncertain.
+
+**Step 4: Split the problem into easier pieces (compositional architecture)**
+
+Trying to estimate all 27 parameters at once (2 global + 5 channels × 5 params) is hard. Instead, we split into two focused problems:
+
+- **Global estimator**: Just 2 parameters — total media contribution % and price elasticity. Conditioned on the 256-number business fingerprint. This is easy — a 2-dimensional problem with 50,000 training examples.
+
+- **Per-channel estimator**: Just 5 parameters per channel — beta, ROAS, contribution fraction, price interaction, distribution interaction. Conditioned on that channel's specific fingerprint (336 numbers: its temporal pattern + cross-channel context + business context).
+
+The key trick: by "unrolling" channels, each of the 50,000 training businesses with 5 channels becomes 5 separate per-channel training examples. So the per-channel estimator gets **250,000 training examples** for a 5-dimensional problem. That's 50,000 examples per parameter — way more than enough.
+
+At inference time on a new business: run the pattern reader once, then run the global estimator once, then run the per-channel estimator 5 times (once per channel). Takes < 1 second total.
+
+**Step 5: Train by practicing on the 50,000 tests**
+
+Training works like this: for each of the 50,000 practice businesses, we:
+1. Feed the observable data through the pattern reader → get the fingerprint
+2. Feed the fingerprint through the NSF → get predicted parameter distributions
+3. Check: does the predicted distribution put high probability on the TRUE parameters (the ones we know from the answer key)?
+4. If not: adjust the neural network's internal weights slightly to make it more accurate
+5. Repeat for all 50,000 businesses, many times over (100-200 passes through the full dataset)
+
+After training, the network has seen so many different business configurations that it can recognize patterns like: "High seasonal spend with strong promo correlation and moderate ROAS → this channel probably has beta around 200, price interaction around 0.2, slow adstock decay."
+
+**Step 6: Apply to a real client**
+
+When a real client gives us their data:
+1. The pattern reader extracts the fingerprint (< 0.1 seconds)
+2. The global estimator produces 10,000 samples of media contribution % and elasticity (< 0.1 seconds)
+3. The per-channel estimator produces 10,000 samples of each channel's parameters (< 0.3 seconds)
+4. We summarize: "Facebook beta = 180 ± 25, ROAS = 0.012 ± 0.003, price interaction = 0.20 ± 0.05"
+
+Total time: under 1 second. Traditional MCMC methods take 2-8 hours for the same answer.
+
+**Why this works**
+
+The network doesn't "fit" each client's data from scratch. It already knows what good answers look like from 50,000 practice runs. When it sees a new business, it pattern-matches: "This looks like practice businesses #4,372, #12,891, and #38,204 — they had betas around 150-200, elasticity around -1.3, and moderate interactions." The answer comes from recognition, not computation.
+
+This is the same principle behind how a doctor with 20 years of experience can diagnose faster than running every possible test — they've seen enough cases to recognize patterns instantly.
+
+---
+
+### Technical details of the neural engine
 
 The inference engine takes observable data and produces posterior distributions over all the parameters described above. It has three main components:
 

@@ -41,11 +41,11 @@ class DilatedConv1DEncoder(nn.Module):
         super().__init__()
         self.conv_layers = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, kernel_size=7, padding=3, dilation=1),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Conv1d(hidden_dim, hidden_dim * 2, kernel_size=5, padding=4, dilation=2),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Conv1d(hidden_dim * 2, output_dim, kernel_size=3, padding=4, dilation=4),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
 
@@ -65,6 +65,21 @@ class DilatedConv1DEncoder(nn.Module):
         h = self.conv_layers(x)
         h = self.pool(h).squeeze(-1)  # (batch, output_dim)
         return h
+
+    def forward_temporal(self, x: Tensor) -> Tensor:
+        """Encode a time series preserving temporal dimension (no pooling).
+
+        Args:
+            x: (batch, T) or (batch, T, C) time series.
+
+        Returns:
+            (batch, output_dim, T) temporal feature map.
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (batch, 1, T)
+        elif x.dim() == 3:
+            x = x.permute(0, 2, 1)  # (batch, C, T)
+        return self.conv_layers(x)  # (batch, output_dim, T)
 
 
 class MultiheadSetAttention(nn.Module):
@@ -223,6 +238,7 @@ class EmbeddingNetwork(nn.Module):
         global_summary_dim: int = 256,
         dropout: float = 0.1,
         n_context_cols: int = MAX_CONTEXT_COLS,
+        n_fixed_channels: int | None = None,
     ):
         super().__init__()
         self.temporal_dim = temporal_dim
@@ -271,6 +287,25 @@ class EmbeddingNetwork(nn.Module):
         # Per-channel projection (for compositional inference)
         # Input: per_channel_emb(channel_dim) + global_summary(global_summary_dim)
         self.per_channel_dim = self.channel_dim + global_summary_dim
+
+        # Temporal projection for per-period embeddings (decomposition mode)
+        # When n_fixed_channels is set: concatenate per-channel features (no averaging)
+        # so the decoder sees each channel's spend pattern individually.
+        # When None: fall back to masked mean (loses channel identity).
+        self.n_fixed_channels = n_fixed_channels
+        if n_fixed_channels is not None:
+            # Concatenate all channels: n_ch * channel_dim + y + ctx + n_ch_scalar
+            temporal_input_dim = n_fixed_channels * self.channel_dim + temporal_dim + temporal_dim + 1
+        else:
+            temporal_input_dim = self.channel_dim + temporal_dim + temporal_dim + 1
+        self.temporal_proj = nn.Sequential(
+            nn.Linear(temporal_input_dim, global_summary_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(global_summary_dim, global_summary_dim),
+            nn.ReLU(),
+        )
+        self.temporal_embedding_dim = global_summary_dim
 
     def forward(
         self,
@@ -346,3 +381,96 @@ class EmbeddingNetwork(nn.Module):
         per_channel_summary = per_channel_summary * channel_mask.unsqueeze(-1).float()
 
         return global_summary, per_channel_summary, channel_mask
+
+    def forward_temporal(
+        self,
+        y: Tensor,
+        spend: Tensor,
+        n_channels: Tensor,
+        channel_type_ids: Tensor,
+        context: Tensor | None = None,
+    ) -> Tensor:
+        """Compute per-period embeddings preserving temporal dimension.
+
+        Instead of pooling across time, this produces one embedding per timestep
+        for use by the temporal decoder.
+
+        Args:
+            y: (batch, T) outcome time series.
+            spend: (batch, T, max_channels) spend matrix.
+            n_channels: (batch,) number of active channels.
+            channel_type_ids: (batch, max_channels) channel type indices.
+            context: (batch, T, n_context_cols) business context matrix (optional).
+
+        Returns:
+            (batch, T, temporal_embedding_dim) per-period embeddings.
+        """
+        batch_size = y.shape[0]
+        T = y.shape[1]
+        max_ch = spend.shape[2]
+
+        # Slice channel_type_ids to match spend's channel dimension
+        channel_type_ids = channel_type_ids[:, :max_ch]
+
+        # Build channel mask
+        ch_indices = torch.arange(max_ch, device=n_channels.device).unsqueeze(0)
+        channel_mask = ch_indices < n_channels.unsqueeze(1)  # (batch, max_ch) True = active
+
+        # 1. Normalize spend globally (preserve relative magnitudes across channels)
+        # Without this, raw spend (10K-80K) causes dying ReLU in the CNN.
+        spend_scale = spend.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1.0)  # (B, 1, 1)
+        spend_normed = spend / spend_scale  # now in [-1, 1], relative magnitudes preserved
+
+        # Per-channel temporal features (no pooling)
+        spend_flat = spend_normed.permute(0, 2, 1).reshape(batch_size * max_ch, T)
+        ch_temporal = self.channel_temporal_encoder.forward_temporal(spend_flat)  # (B*C, D, T')
+        T_out = ch_temporal.shape[-1]  # may differ from T due to conv padding
+        ch_temporal = ch_temporal.reshape(batch_size, max_ch, self.temporal_dim, T_out)
+
+        # 2. Add channel-type embeddings (broadcast across time)
+        type_emb = self.channel_type_embedding(channel_type_ids)  # (B, max_ch, type_dim)
+        type_emb_t = type_emb.unsqueeze(-1).expand(-1, -1, -1, T_out)  # (B, max_ch, type_dim, T_out)
+        ch_combined = torch.cat([ch_temporal, type_emb_t], dim=2)  # (B, max_ch, channel_dim, T_out)
+
+        # 3. Aggregate channels per timestep
+        if self.n_fixed_channels is not None:
+            # Concatenate all per-channel features so decoder sees each channel individually
+            # ch_combined: (B, max_ch, channel_dim, T_out) → flatten channels
+            ch_combined = ch_combined * channel_mask.float().unsqueeze(-1).unsqueeze(-1)
+            # Take first n_fixed_channels and flatten: (B, n_fixed * channel_dim, T_out)
+            ch_agg = ch_combined[:, :self.n_fixed_channels].reshape(
+                batch_size, self.n_fixed_channels * self.channel_dim, T_out
+            )
+        else:
+            # Fall back to masked mean (loses per-channel identity)
+            mask = channel_mask.float().unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+            n_active = mask.sum(dim=1).clamp(min=1)  # (B, 1, 1)
+            ch_agg = (ch_combined * mask).sum(dim=1) / n_active  # (B, channel_dim, T_out)
+
+        # 4. Y temporal features (no pooling) — normalize to prevent dying ReLU
+        y_scale = y.abs().amax(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
+        y_normed = y / y_scale
+        y_temporal = self.y_encoder.forward_temporal(y_normed)  # (B, D, T_out)
+
+        # 5. Context temporal features (no pooling) — normalize per column
+        if context is not None:
+            ctx_scale = context.abs().amax(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1, C_ctx)
+            ctx_normed = context / ctx_scale
+            ctx_temporal = self.context_encoder.forward_temporal(ctx_normed)  # (B, D, T_out)
+        else:
+            ctx_temporal = torch.zeros(
+                batch_size, self.temporal_dim, T_out, device=y.device
+            )
+
+        # 6. n_channels broadcast to all timesteps
+        n_ch_norm = (n_channels.float() / MAX_CHANNELS).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        n_ch_t = n_ch_norm.expand(-1, -1, T_out)  # (B, 1, T_out)
+
+        # 7. Concatenate per-timestep features
+        combined = torch.cat([ch_agg, y_temporal, ctx_temporal, n_ch_t], dim=1)  # (B, D_total, T_out)
+        combined = combined.permute(0, 2, 1)  # (B, T_out, D_total)
+
+        # 8. Project to embedding dim
+        temporal_emb = self.temporal_proj(combined)  # (B, T_out, temporal_embedding_dim)
+
+        return temporal_emb

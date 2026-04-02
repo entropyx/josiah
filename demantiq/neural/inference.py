@@ -273,8 +273,8 @@ class DemantiqInferenceEngine:
                      self._n_reduced_params, _GLOBAL_REDUCED, self._n_theta_channels, _REDUCED_PER_CH)
 
         # Compute normalization scales from training data
-        beta_max = 1.0
-        roas_max = 1.0
+        beta_max = 0.0
+        roas_max = 0.0
         elasticity_vals = ext_stack[:, 1]  # price_elasticity at index 1
         elasticity_max = max(float(elasticity_vals.abs().max()), 1.0)
 
@@ -289,9 +289,9 @@ class DemantiqInferenceEngine:
             if roas_vals.abs().max() > roas_max:
                 roas_max = float(roas_vals.abs().max())
 
-        self._beta_scale = beta_max
-        self._roas_scale = roas_max
-        self._elasticity_scale = elasticity_max
+        self._beta_scale = max(beta_max, 1.0)
+        self._roas_scale = max(roas_max, 0.001)
+        self._elasticity_scale = max(elasticity_max, 0.1)
         logger.info("Normalization scales: beta_max=%.1f, roas_max=%.3f, elasticity_max=%.3f",
                      beta_max, roas_max, elasticity_max)
 

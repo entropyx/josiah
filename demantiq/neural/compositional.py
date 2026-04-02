@@ -285,9 +285,10 @@ class CompositionalInferenceEngine:
                 channel_type_ids=type_ids_t, context=ctx,
             )
 
-        # Sample from global posterior
-        global_samples = self.global_posterior.sample(
-            (n_samples,), x=global_emb.squeeze(0)
+        # Sample from posteriors using the underlying flow directly
+        # (bypasses sbi's rejection sampling which crashes on spline edge cases)
+        global_samples = _sample_direct(
+            self.global_posterior, n_samples, global_emb.squeeze(0)
         ).cpu().numpy()
 
         result = {
@@ -307,8 +308,8 @@ class CompositionalInferenceEngine:
                 global_emb.squeeze(0),
             ]).to(self.device)
 
-            ch_samples = self.channel_posterior.sample(
-                (n_samples,), x=x_ch
+            ch_samples = _sample_direct(
+                self.channel_posterior, n_samples, x_ch
             ).cpu().numpy()
 
             all_ch_samples[name] = ch_samples
@@ -329,17 +330,27 @@ class CompositionalInferenceEngine:
         return result
 
     def _pretrain_embedding(self, dataset) -> None:
-        """Pre-train embedding network on a regression objective."""
-        from demantiq.neural.inference import pack_observations
+        """Pre-train embedding network with both global and per-channel objectives.
 
+        Two prediction heads trained simultaneously:
+        - Global head: global_summary(256) → [media_pct, elasticity, mean_beta, mean_roas]
+        - Per-channel head: per_channel_summary(336) → [beta, roas, contrib_frac, px_media, dx_media]
+
+        The per-channel head forces the Set Transformer to produce DIFFERENTIATED
+        per-channel embeddings, not identical ones.
+        """
         self.embedding_net.train()
 
-        # Prediction head: global_summary → aggregate metrics
-        pred_head = nn.Linear(self.config.global_summary_dim, 4).to(self.device)
-        # Targets: media_pct, elasticity, mean_beta, mean_roas
+        per_ch_dim = self.embedding_net.per_channel_dim  # 336
+
+        # Two prediction heads
+        global_head = nn.Linear(self.config.global_summary_dim, 4).to(self.device)
+        channel_head = nn.Linear(per_ch_dim, 5).to(self.device)
 
         optimizer = torch.optim.Adam(
-            list(self.embedding_net.parameters()) + list(pred_head.parameters()),
+            list(self.embedding_net.parameters())
+            + list(global_head.parameters())
+            + list(channel_head.parameters()),
             lr=self.config.embed_lr,
         )
 
@@ -349,15 +360,17 @@ class CompositionalInferenceEngine:
 
         for epoch in range(self.config.embed_epochs):
             total_loss = 0.0
+            global_loss_sum = 0.0
+            channel_loss_sum = 0.0
             n_batches = 0
 
             for start in range(0, n_total, bs):
                 batch_idx = indices[start:start + bs]
                 batch_items = [dataset[int(i)] for i in batch_idx]
+                batch_size_actual = len(batch_items)
 
                 y_batch = torch.stack([item["y"] for item in batch_items]).to(self.device)
                 spend_raw = torch.stack([item["spend"] for item in batch_items])
-                # Pad spend to MAX_CHANNELS to match type_ids dimension
                 if spend_raw.shape[2] < MAX_CHANNELS:
                     pad = torch.zeros(spend_raw.shape[0], spend_raw.shape[1],
                                       MAX_CHANNELS - spend_raw.shape[2])
@@ -369,13 +382,12 @@ class CompositionalInferenceEngine:
                                               for item in batch_items]).to(self.device)
                 ctx_batch = torch.stack([item["context"] for item in batch_items]).to(self.device)
 
-                # Targets
-                targets = torch.zeros(len(batch_items), 4, device=self.device)
+                # Global targets
+                global_targets = torch.zeros(batch_size_actual, 4, device=self.device)
                 for j, item in enumerate(batch_items):
                     ext = item["ext_truth"]
-                    targets[j, 0] = ext[0]  # media_pct
-                    targets[j, 1] = ext[1]  # elasticity (raw, will scale later)
-                    # mean beta and mean roas across active channels
+                    global_targets[j, 0] = ext[0]  # media_pct
+                    global_targets[j, 1] = ext[1]  # elasticity
                     n_ch = item["n_channels"]
                     beta_sum, roas_sum = 0.0, 0.0
                     for ch in range(min(n_ch, self._n_theta_channels)):
@@ -383,27 +395,68 @@ class CompositionalInferenceEngine:
                         if base < len(ext):
                             beta_sum += ext[base + 0].item()
                             roas_sum += ext[base + 1].item()
-                    targets[j, 2] = beta_sum / max(n_ch, 1) / 500.0  # normalize
-                    targets[j, 3] = roas_sum / max(n_ch, 1)
+                    global_targets[j, 2] = beta_sum / max(n_ch, 1) / 500.0
+                    global_targets[j, 3] = roas_sum / max(n_ch, 1)
 
-                global_emb, _, _ = self.embedding_net(
+                # Per-channel targets: collect (sample_idx, ch_idx, target_vector)
+                ch_targets_list = []
+                ch_indices = []  # (sample_idx, ch_idx) pairs
+                for j, item in enumerate(batch_items):
+                    ext = item["ext_truth"]
+                    n_ch = min(item["n_channels"], self._n_theta_channels)
+                    for ch_idx in range(n_ch):
+                        base = _GLOBAL_EXT_TRUTH_LEN + ch_idx * _PER_CHANNEL_EXT_TRUTH_LEN
+                        if base + 14 < len(ext):
+                            target = torch.zeros(5)
+                            target[0] = ext[base + 0] / 500.0   # beta normalized
+                            target[1] = ext[base + 1]            # roas (raw, small)
+                            target[2] = ext[base + 3]            # contribution_frac
+                            target[3] = ext[base + 13]           # price_x_media
+                            target[4] = ext[base + 14]           # dist_x_media
+                            ch_targets_list.append(target)
+                            ch_indices.append((j, ch_idx))
+
+                # Forward pass
+                global_emb, per_ch_emb, ch_mask = self.embedding_net(
                     y=y_batch, spend=spend_batch, n_channels=n_ch_batch,
                     channel_type_ids=type_ids_batch, context=ctx_batch,
                 )
 
-                preds = pred_head(global_emb)
-                loss = nn.functional.mse_loss(preds, targets)
+                # Global loss
+                global_preds = global_head(global_emb)
+                loss_global = nn.functional.mse_loss(global_preds, global_targets)
+
+                # Per-channel loss
+                if ch_targets_list:
+                    ch_targets = torch.stack(ch_targets_list).to(self.device)
+                    # Gather the corresponding per-channel embeddings
+                    ch_embs = torch.stack([
+                        per_ch_emb[sample_idx, ch_idx]
+                        for sample_idx, ch_idx in ch_indices
+                    ])
+                    ch_preds = channel_head(ch_embs)
+                    loss_channel = nn.functional.mse_loss(ch_preds, ch_targets)
+                else:
+                    loss_channel = torch.tensor(0.0, device=self.device)
+
+                # Combined loss (weight channel loss higher to force differentiation)
+                loss = loss_global + 2.0 * loss_channel
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
                 total_loss += loss.item()
+                global_loss_sum += loss_global.item()
+                channel_loss_sum += loss_channel.item()
                 n_batches += 1
 
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                logger.info("Embedding pre-training epoch %d/%d, loss=%.6f",
-                             epoch + 1, self.config.embed_epochs, total_loss / max(n_batches, 1))
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                logger.info("Embedding epoch %d/%d: total=%.4f (global=%.4f, channel=%.4f)",
+                             epoch + 1, self.config.embed_epochs,
+                             total_loss / max(n_batches, 1),
+                             global_loss_sum / max(n_batches, 1),
+                             channel_loss_sum / max(n_batches, 1))
 
     def _extract_embeddings(self, dataset) -> tuple[Tensor, Tensor]:
         """Extract global and per-channel embeddings for all samples (no gradient)."""
@@ -526,7 +579,7 @@ class CompositionalInferenceEngine:
             show_train_summary=True,
         )
 
-        posterior = trainer.build_posterior(density_estimator)
+        posterior = trainer.build_posterior(density_estimator, sample_with="direct")
         logger.info("%s NSF training complete.", label.capitalize())
         return posterior
 
@@ -579,7 +632,29 @@ class CompositionalInferenceEngine:
         self.global_posterior = checkpoint["global_posterior"]
         self.channel_posterior = checkpoint["channel_posterior"]
         self._is_trained = checkpoint["is_trained"]
+
+        # Force direct sampling (skip rejection against prior to avoid spline crashes)
+        if hasattr(self.global_posterior, '_sample_with'):
+            self.global_posterior._sample_with = "direct"
+        if hasattr(self.channel_posterior, '_sample_with'):
+            self.channel_posterior._sample_with = "direct"
+
         logger.info("Compositional model loaded from %s", path)
+
+
+def _sample_direct(posterior, n_samples: int, x: Tensor) -> Tensor:
+    """Sample directly from the posterior's underlying flow.
+
+    Bypasses sbi's rejection sampling which hangs/crashes when the NSF
+    produces samples outside the prior bounds.
+    """
+    net = posterior.posterior_estimator
+    x_context = x.unsqueeze(0) if x.dim() == 1 else x
+    with torch.no_grad():
+        samples = net.sample(torch.Size((n_samples,)), condition=x_context)
+    if samples.dim() == 3:
+        samples = samples.squeeze(1)
+    return samples.detach()
 
 
 def _summarize(samples: np.ndarray) -> dict[str, float]:

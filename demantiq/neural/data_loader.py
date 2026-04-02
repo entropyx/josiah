@@ -18,6 +18,7 @@ from demantiq.orchestration.training_format import (
     MAX_CONTEXT_COLS,
     EXT_TRUTH_VECTOR_LEN,
     CONFIG_VECTOR_LEN,
+    DECOMP_COLS,
 )
 
 
@@ -52,6 +53,7 @@ class DemantiqDataset(Dataset):
         all_y = []
         all_spend = []
         all_context = []
+        all_decomp = []
         all_config = []
         all_truth = []
         all_ext_truth = []
@@ -102,6 +104,15 @@ class DemantiqDataset(Dataset):
                     np.zeros((n_in_batch, t_dim, MAX_CONTEXT_COLS), dtype=np.float64)
                 )
 
+            # Per-period decomposition (backward compatible — zero if absent)
+            if "decomposition" in data:
+                all_decomp.append(data["decomposition"][:n_in_batch])
+            else:
+                t_dim = data["y"].shape[1]
+                all_decomp.append(
+                    np.zeros((n_in_batch, t_dim, DECOMP_COLS), dtype=np.float64)
+                )
+
             all_channel_names.extend(batch_channel_names[:n_in_batch])
             all_n_periods.extend(batch_n_periods[:n_in_batch])
 
@@ -114,7 +125,8 @@ class DemantiqDataset(Dataset):
         y_arrays = []
         spend_arrays = []
         context_arrays = []
-        for y_arr, sp_arr, ctx_arr in zip(all_y, all_spend, all_context):
+        decomp_arrays = []
+        for y_arr, sp_arr, ctx_arr, dec_arr in zip(all_y, all_spend, all_context, all_decomp):
             # Pad time dimension
             pad_t = max_t - y_arr.shape[1]
             if pad_t > 0:
@@ -137,9 +149,15 @@ class DemantiqDataset(Dataset):
                 )
             context_arrays.append(ctx_arr)
 
+            pad_t_dec = max_t - dec_arr.shape[1]
+            if pad_t_dec > 0:
+                dec_arr = np.pad(dec_arr, ((0, 0), (0, pad_t_dec), (0, 0)))
+            decomp_arrays.append(dec_arr)
+
         self.y = np.concatenate(y_arrays, axis=0).astype(np.float32)
         self.spend = np.concatenate(spend_arrays, axis=0).astype(np.float32)
         self.context = np.concatenate(context_arrays, axis=0).astype(np.float32)
+        self.decomposition = np.concatenate(decomp_arrays, axis=0).astype(np.float32)
         self.config_vectors = np.concatenate(all_config, axis=0).astype(np.float32)
         self.truth_vectors = np.concatenate(all_truth, axis=0).astype(np.float32)
         self.ext_truth_vectors = np.concatenate(all_ext_truth, axis=0).astype(np.float32)
@@ -165,6 +183,7 @@ class DemantiqDataset(Dataset):
             "y": torch.from_numpy(self.y[idx]),
             "spend": torch.from_numpy(self.spend[idx]),
             "context": torch.from_numpy(self.context[idx]),
+            "decomposition": torch.from_numpy(self.decomposition[idx]),
             "n_periods": self.n_periods[idx],
             "n_channels": n_ch,
             "channel_type_ids": torch.from_numpy(self.channel_type_ids[idx]),

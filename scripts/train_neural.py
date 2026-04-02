@@ -99,6 +99,466 @@ def load_engine():
     return engine
 
 
+# =========================================================================
+#  DECOMPOSITION ENGINE (Phase A — per-period demand decomposition)
+# =========================================================================
+
+DECOMP_MODEL_DIR = OUTPUT_DIR / "decomp_model"
+
+
+def train_decomposition_engine(
+    n_epochs: int = 50,
+    n_train: int = 500,
+    n_fixed_channels: int | None = None,
+    learning_rate: float = 1e-3,
+):
+    """Train the decomposition engine (encoder-decoder for per-period shares)."""
+    from demantiq.neural.decomposition_engine import DecompositionEngine, DecompositionConfig
+
+    config = DecompositionConfig(
+        n_epochs=n_epochs,
+        n_train=n_train,
+        data_dir=str(TRAINING_DATA_DIR),
+        learning_rate=learning_rate,
+        batch_size=256,
+        patience=15,
+        n_fixed_channels=n_fixed_channels,
+    )
+
+    engine = DecompositionEngine(config)
+    metrics = engine.train(data_dir=str(TRAINING_DATA_DIR), n_train=n_train)
+    engine.save(str(DECOMP_MODEL_DIR))
+
+    logger.info("Decomposition training metrics: %s", metrics)
+    return engine
+
+
+def evaluate_decomposition(engine, scenario_name: str):
+    """Evaluate decomposition engine on a named scenario with time series plots."""
+    from demantiq.scenarios.scenario_library import ScenarioLibrary
+    from demantiq.core.demand_kernel import simulate
+    from demantiq.orchestration.training_format import (
+        extract_context_matrix,
+        ground_truth_to_decomposition,
+        DECOMP_IDX_BASELINE,
+        DECOMP_IDX_CHANNELS_START,
+        DECOMP_IDX_PRICE,
+        DECOMP_IDX_DISTRIBUTION,
+        DECOMP_IDX_COMPETITION,
+        DECOMP_IDX_MACRO,
+        DECOMP_IDX_NOISE,
+        DECOMP_COLS,
+    )
+    from demantiq.neural.utils import CHANNEL_NAME_TO_IDX, MAX_CHANNELS
+
+    logger.info("=== Evaluating decomposition: %s ===", scenario_name)
+
+    config = ScenarioLibrary.get(scenario_name)
+    result = simulate(config)
+
+    channel_names = [ch.name for ch in config.channels]
+    n_ch = len(channel_names)
+    y = result.observable_data["y"].values
+    T = config.n_periods
+
+    # Build inputs
+    spend_matrix = np.column_stack([
+        result.observable_data[f"{ch}_spend"].values for ch in channel_names
+    ])
+    # Pad spend to MAX_CHANNELS
+    if spend_matrix.shape[1] < MAX_CHANNELS:
+        spend_matrix = np.pad(
+            spend_matrix, ((0, 0), (0, MAX_CHANNELS - spend_matrix.shape[1]))
+        )
+
+    context_matrix = extract_context_matrix(result.observable_data, T)
+
+    channel_type_ids = np.zeros(MAX_CHANNELS, dtype=np.int64)
+    for i, ch_name in enumerate(channel_names):
+        if i < MAX_CHANNELS:
+            channel_type_ids[i] = CHANNEL_NAME_TO_IDX.get(ch_name, 0)
+
+    # Run inference
+    t0 = time.time()
+    inf = engine.infer(y, spend_matrix, context_matrix, n_ch, channel_type_ids, T)
+    logger.info("Inference took %.3f seconds", time.time() - t0)
+
+    pred_shares = inf["shares"]       # (T, DECOMP_COLS)
+    pred_contrib = inf["contributions"]  # (T, DECOMP_COLS)
+    y_recon = inf["y_reconstructed"]  # (T,)
+
+    # True decomposition
+    true_decomp = ground_truth_to_decomposition(result.ground_truth, channel_names, T)
+
+    # Compute true shares
+    y_safe = np.maximum(y[:T], 1.0)
+    true_shares = true_decomp / y_safe[:, np.newaxis]
+    true_shares[:, DECOMP_IDX_DISTRIBUTION] = 0.0  # multiplicative, skip
+
+    # ---- Metrics ----
+    # Per-component contribution R² (meaningful metric — not trivially 1.0)
+    # For each component, how well does predicted contribution match true contribution?
+    component_names = ["baseline"] + channel_names + ["price", "distribution", "competition", "macro", "noise"]
+    component_indices = [DECOMP_IDX_BASELINE]
+    for i in range(n_ch):
+        component_indices.append(DECOMP_IDX_CHANNELS_START + i)
+    component_indices.extend([DECOMP_IDX_PRICE, DECOMP_IDX_DISTRIBUTION,
+                              DECOMP_IDX_COMPETITION, DECOMP_IDX_MACRO, DECOMP_IDX_NOISE])
+
+    # Overall share MSE across all components and timesteps
+    active_mask = np.ones(DECOMP_COLS, dtype=bool)
+    active_mask[DECOMP_IDX_DISTRIBUTION] = False
+    overall_share_mse = np.mean((pred_shares[:, active_mask] - true_shares[:, active_mask]) ** 2)
+
+    print(f"\n{'='*70}")
+    print(f"  DECOMPOSITION EVALUATION — {scenario_name}")
+    print(f"  Channels: {n_ch} | Periods: {T}")
+    print(f"{'='*70}")
+    print(f"\n  Overall Share MSE:       {overall_share_mse:.6f}")
+    print(f"  Mean |y|:                {np.mean(np.abs(y[:T])):.1f}")
+    print(f"  (Note: y-level R² is trivially 1.0 since softmax shares sum to 1)")
+
+    print(f"\n{'Component':<16} {'True Share':>12} {'Pred Share':>12} {'Share MSE':>12} {'Comp R²':>10} {'True Total':>12} {'Pred Total':>12}")
+    print("-" * 90)
+    for name, idx in zip(component_names, component_indices):
+        if idx == DECOMP_IDX_DISTRIBUTION:
+            continue  # skip multiplicative
+        ts = true_shares[:, idx]
+        ps = pred_shares[:, idx]
+        mse = np.mean((ts - ps) ** 2)
+        true_total = np.sum(true_decomp[:, idx])
+        pred_total = np.sum(pred_contrib[:, idx])
+        # Per-component R²: how well does predicted contribution track true contribution over time?
+        tc = true_decomp[:, idx]
+        pc = pred_contrib[:, idx]
+        ss_res = np.sum((tc - pc) ** 2)
+        ss_tot = np.sum((tc - tc.mean()) ** 2)
+        comp_r2 = 1 - ss_res / ss_tot if ss_tot > 1e-6 else 0.0
+        print(f"{name:<16} {np.mean(ts):>12.4f} {np.mean(ps):>12.4f} {mse:>12.6f} {comp_r2:>10.4f} {true_total:>12.0f} {pred_total:>12.0f}")
+
+    # High-level category breakdown
+    total_y = np.sum(y[:T])
+    true_baseline_total = np.sum(true_decomp[:, DECOMP_IDX_BASELINE])
+    pred_baseline_total = np.sum(pred_contrib[:, DECOMP_IDX_BASELINE])
+    true_media_total = sum(np.sum(true_decomp[:, DECOMP_IDX_CHANNELS_START + i]) for i in range(n_ch))
+    pred_media_total = sum(np.sum(pred_contrib[:, DECOMP_IDX_CHANNELS_START + i]) for i in range(n_ch))
+    true_other_total = (np.sum(true_decomp[:, DECOMP_IDX_PRICE])
+                        + np.sum(true_decomp[:, DECOMP_IDX_COMPETITION])
+                        + np.sum(true_decomp[:, DECOMP_IDX_MACRO]))
+    pred_other_total = (np.sum(pred_contrib[:, DECOMP_IDX_PRICE])
+                        + np.sum(pred_contrib[:, DECOMP_IDX_COMPETITION])
+                        + np.sum(pred_contrib[:, DECOMP_IDX_MACRO]))
+    true_noise_total = np.sum(true_decomp[:, DECOMP_IDX_NOISE])
+    pred_noise_total = np.sum(pred_contrib[:, DECOMP_IDX_NOISE])
+
+    print(f"\n--- Category Breakdown ---")
+    print(f"{'Category':<16} {'True %':>10} {'Pred %':>10} {'Error':>10}")
+    print("-" * 50)
+    for cat, tv, pv in [
+        ("Baseline",    true_baseline_total, pred_baseline_total),
+        ("Media",       true_media_total,    pred_media_total),
+        ("Other",       true_other_total,    pred_other_total),
+        ("Noise",       true_noise_total,    pred_noise_total),
+    ]:
+        tp = tv / total_y * 100
+        pp = pv / total_y * 100
+        print(f"{cat:<16} {tp:>9.1f}% {pp:>9.1f}% {abs(pp - tp):>9.1f}pp")
+
+    # Weekly accuracy: per-week correlation between true and predicted share vectors
+    from scipy.stats import spearmanr
+    active_cols = [DECOMP_IDX_BASELINE]
+    for i in range(n_ch):
+        active_cols.append(DECOMP_IDX_CHANNELS_START + i)
+    active_cols.extend([DECOMP_IDX_PRICE, DECOMP_IDX_COMPETITION, DECOMP_IDX_MACRO, DECOMP_IDX_NOISE])
+
+    weekly_corrs = []
+    weekly_mapes = []
+    for t in range(T):
+        ts_week = true_shares[t, active_cols]
+        ps_week = pred_shares[t, active_cols]
+        # Spearman rank correlation — does the ranking hold?
+        if np.std(ts_week) > 1e-8 and np.std(ps_week) > 1e-8:
+            corr, _ = spearmanr(ts_week, ps_week)
+            weekly_corrs.append(corr)
+        # Weekly MAPE on shares
+        denom = np.maximum(np.abs(ts_week), 0.01)
+        weekly_mapes.append(np.mean(np.abs(ts_week - ps_week) / denom))
+
+    weekly_corrs = np.array(weekly_corrs)
+    weekly_mapes = np.array(weekly_mapes)
+
+    # Weekly component accuracy: for each week, R² across components
+    # "Given the true shares [0.62, 0.06, 0.15, 0.02, ...], how close are the predicted shares?"
+    weekly_r2s = []
+    for t in range(T):
+        ts_week = true_shares[t, active_cols]
+        ps_week = pred_shares[t, active_cols]
+        ss_res = np.sum((ts_week - ps_week) ** 2)
+        ss_tot = np.sum((ts_week - ts_week.mean()) ** 2)
+        wr2 = 1 - ss_res / ss_tot if ss_tot > 1e-8 else 0.0
+        weekly_r2s.append(wr2)
+    weekly_r2s = np.array(weekly_r2s)
+
+    print(f"\n--- Weekly Accuracy ---")
+    print(f"  Mean weekly R² (across components): {np.mean(weekly_r2s):.4f}")
+    print(f"  Median weekly R²:                   {np.median(weekly_r2s):.4f}")
+    print(f"  Worst week R²:         {np.min(weekly_r2s):.4f}  (week {np.argmin(weekly_r2s) + 1})")
+    print(f"  Best week R²:          {np.max(weekly_r2s):.4f}  (week {np.argmax(weekly_r2s) + 1})")
+    print(f"  % weeks with R² > 0.8:              {np.mean(weekly_r2s > 0.8) * 100:.0f}%")
+    print(f"  % weeks with R² > 0.5:              {np.mean(weekly_r2s > 0.5) * 100:.0f}%")
+    print(f"  Mean weekly rank correlation:        {np.mean(weekly_corrs):.3f}")
+    print(f"  Worst week correlation:              {np.min(weekly_corrs):.3f}  (week {np.argmin(weekly_corrs) + 1})")
+    print(f"  % weeks with corr > 0.8:             {np.mean(weekly_corrs > 0.8) * 100:.0f}%")
+    print(f"  Mean weekly share MAPE:              {np.mean(weekly_mapes) * 100:.1f}%")
+
+    # Channel-only metrics (excludes baseline — catches channel collapse)
+    ch_cols = [DECOMP_IDX_CHANNELS_START + i for i in range(n_ch)]
+    ch_corrs = []
+    for t in range(T):
+        ts_ch = true_shares[t, ch_cols]
+        ps_ch = pred_shares[t, ch_cols]
+        if np.std(ts_ch) > 1e-8 and np.std(ps_ch) > 1e-8:
+            corr, _ = spearmanr(ts_ch, ps_ch)
+            ch_corrs.append(corr)
+    ch_corrs = np.array(ch_corrs) if ch_corrs else np.array([0.0])
+
+    # Channel-only total ranking
+    true_ch_totals = np.array([np.sum(true_decomp[:, DECOMP_IDX_CHANNELS_START + i]) for i in range(n_ch)])
+    pred_ch_totals = np.array([np.sum(pred_contrib[:, DECOMP_IDX_CHANNELS_START + i]) for i in range(n_ch)])
+    true_rank = np.argsort(-true_ch_totals)
+    pred_rank = np.argsort(-pred_ch_totals)
+    true_rank_names = [channel_names[i] for i in true_rank]
+    pred_rank_names = [channel_names[i] for i in pred_rank]
+    if n_ch >= 2:
+        overall_ch_corr, _ = spearmanr(true_ch_totals, pred_ch_totals)
+    else:
+        overall_ch_corr = 0.0
+
+    print(f"\n--- Channel-Only Metrics (excludes baseline) ---")
+    print(f"  Weekly channel rank correlation:     {np.mean(ch_corrs):.3f}")
+    print(f"  % weeks channel corr > 0.5:          {np.mean(ch_corrs > 0.5) * 100:.0f}%")
+    print(f"  Overall channel total correlation:   {overall_ch_corr:.3f}")
+    print(f"  True ranking:  {' > '.join(true_rank_names)}")
+    print(f"  Pred ranking:  {' > '.join(pred_rank_names)}")
+
+    # Total contribution per channel
+    print(f"\n{'Channel':<16} {'True Contrib':>14} {'Pred Contrib':>14} {'Error %':>10}")
+    print("-" * 58)
+    for i, ch in enumerate(channel_names):
+        idx = DECOMP_IDX_CHANNELS_START + i
+        true_total = np.sum(true_decomp[:, idx])
+        pred_total = np.sum(pred_contrib[:, idx])
+        err = abs(pred_total - true_total) / max(abs(true_total), 1.0) * 100
+        print(f"{ch:<16} {true_total:>14.0f} {pred_total:>14.0f} {err:>9.1f}%")
+
+    # Reconstruction R² (how well predicted contributions sum to actual y)
+    ss_res = np.sum((y[:T] - y_recon) ** 2)
+    ss_tot = np.sum((y[:T] - y[:T].mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    rmse = np.sqrt(np.mean((y[:T] - y_recon) ** 2))
+    print(f"\n  Reconstruction R²:       {r2:.4f}  (sum of predicted contributions vs actual y)")
+    print(f"  Reconstruction RMSE:     {rmse:.1f}")
+
+    # ---- Plots ----
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    dates = result.observable_data["date"].values[:T]
+
+    # 1. Actual vs Predicted y(t)
+    _plot_decomp_actual_vs_predicted(dates, y[:T], y_recon, r2, rmse, scenario_name)
+
+    # 2. Per-channel contribution time series
+    _plot_decomp_channel_contributions(
+        dates, true_decomp, pred_contrib, channel_names, scenario_name,
+    )
+
+    # 3. Monthly decomposition (stacked area)
+    _plot_decomp_monthly_stacked(
+        result.observable_data, true_decomp, pred_contrib,
+        channel_names, scenario_name,
+    )
+
+    # 4. Training loss curve
+    if hasattr(engine, "train_losses") and engine.train_losses:
+        _plot_decomp_loss_curve(engine.train_losses, engine.val_losses, scenario_name)
+
+    logger.info("Plots saved to %s/", PLOTS_DIR)
+
+    # Save results CSV
+    _save_decomp_results_csv(
+        scenario_name, channel_names, T, r2, rmse,
+        true_decomp, pred_contrib, pred_shares, true_shares,
+    )
+
+
+def _plot_decomp_actual_vs_predicted(dates, y_actual, y_pred, r2, rmse, scenario):
+    """Plot actual vs predicted y with residuals."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), height_ratios=[3, 1], sharex=True)
+
+    ax1.plot(dates, y_actual, color="#2196F3", linewidth=1.5, label="Actual", alpha=0.9)
+    ax1.plot(dates, y_pred, color="#FF9800", linewidth=1.5, label="Predicted (decomp sum)", alpha=0.9)
+    ax1.fill_between(dates, y_actual, y_pred, alpha=0.1, color="gray")
+    ax1.set_ylabel("Demand (y)")
+    ax1.set_title(f"Actual vs Predicted — {scenario}  |  R²={r2:.4f}  RMSE={rmse:.1f}")
+    ax1.legend()
+
+    residuals = y_actual - y_pred
+    colors = np.where(residuals >= 0, "#4CAF50", "#F44336")
+    ax2.bar(dates, residuals, color=colors, alpha=0.6, width=5)
+    ax2.axhline(0, color="black", linewidth=0.5)
+    ax2.set_ylabel("Residual")
+    ax2.set_xlabel("Date")
+
+    fig.tight_layout()
+    fig.savefig(PLOTS_DIR / f"{scenario}_decomp_actual_vs_predicted.png", dpi=150)
+    plt.close(fig)
+    logger.info("Actual vs predicted plot saved (R²=%.4f)", r2)
+
+
+def _plot_decomp_channel_contributions(dates, true_decomp, pred_contrib, channel_names, scenario):
+    """Per-channel contribution time series: true vs predicted."""
+    from demantiq.orchestration.training_format import DECOMP_IDX_CHANNELS_START, DECOMP_IDX_BASELINE
+
+    n_ch = len(channel_names)
+    n_plots = n_ch + 1  # channels + baseline
+    cols = min(n_plots, 3)
+    rows = (n_plots + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), sharex=True)
+    if n_plots == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    # Baseline
+    ax = axes[0]
+    ax.plot(dates, true_decomp[:, DECOMP_IDX_BASELINE], color="#2196F3", label="True", linewidth=1.2)
+    ax.plot(dates, pred_contrib[:, DECOMP_IDX_BASELINE], color="#FF9800", label="Predicted", linewidth=1.2, linestyle="--")
+    ax.set_title("Baseline")
+    ax.legend(fontsize=7)
+    ax.set_ylabel("Contribution")
+
+    # Per-channel
+    for i, ch in enumerate(channel_names):
+        ax = axes[i + 1]
+        idx = DECOMP_IDX_CHANNELS_START + i
+        ax.plot(dates, true_decomp[:, idx], color="#2196F3", label="True", linewidth=1.2)
+        ax.plot(dates, pred_contrib[:, idx], color="#FF9800", label="Predicted", linewidth=1.2, linestyle="--")
+        ax.set_title(ch)
+        ax.legend(fontsize=7)
+
+    for i in range(n_plots, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle(f"Per-Component Contributions — {scenario}", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(PLOTS_DIR / f"{scenario}_decomp_contributions.png", dpi=150)
+    plt.close(fig)
+
+
+def _plot_decomp_monthly_stacked(observable_data, true_decomp, pred_contrib, channel_names, scenario):
+    """Stacked area chart of monthly decomposition: true vs predicted."""
+    import pandas as pd
+    from demantiq.orchestration.training_format import (
+        DECOMP_IDX_BASELINE, DECOMP_IDX_CHANNELS_START,
+        DECOMP_IDX_PRICE, DECOMP_IDX_MACRO, DECOMP_IDX_NOISE,
+    )
+
+    dates = observable_data["date"].values[:true_decomp.shape[0]]
+    T = len(dates)
+
+    # Build DataFrames for true and predicted
+    def _build_df(matrix):
+        df = pd.DataFrame({"date": dates})
+        df["baseline"] = matrix[:T, DECOMP_IDX_BASELINE]
+        for i, ch in enumerate(channel_names):
+            df[ch] = matrix[:T, DECOMP_IDX_CHANNELS_START + i]
+        if np.any(matrix[:T, DECOMP_IDX_PRICE] != 0):
+            df["price_effect"] = matrix[:T, DECOMP_IDX_PRICE]
+        if np.any(matrix[:T, DECOMP_IDX_MACRO] != 0):
+            df["macro"] = matrix[:T, DECOMP_IDX_MACRO]
+        return df
+
+    true_df = _build_df(true_decomp)
+    pred_df = _build_df(pred_contrib)
+
+    true_monthly = true_df.set_index("date").resample("ME").sum()
+    pred_monthly = pred_df.set_index("date").resample("ME").sum()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    cols = [c for c in true_monthly.columns]
+    colors = plt.cm.Set2(np.linspace(0, 1, len(cols)))
+
+    ax1.stackplot(true_monthly.index, [true_monthly[c].values for c in cols],
+                  labels=cols, colors=colors, alpha=0.8)
+    ax1.set_title("True Monthly Decomposition")
+    ax1.set_ylabel("Demand")
+    ax1.legend(loc="upper left", fontsize=7)
+
+    cols_pred = [c for c in cols if c in pred_monthly.columns]
+    ax2.stackplot(pred_monthly.index, [pred_monthly[c].values for c in cols_pred],
+                  labels=cols_pred, colors=colors[:len(cols_pred)], alpha=0.8)
+    ax2.set_title("Predicted Monthly Decomposition")
+    ax2.set_ylabel("Demand")
+    ax2.legend(loc="upper left", fontsize=7)
+
+    fig.suptitle(f"Monthly Demand Decomposition — {scenario}", fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.savefig(PLOTS_DIR / f"{scenario}_decomp_monthly.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_decomp_loss_curve(train_losses, val_losses, scenario):
+    """Training and validation loss over epochs."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    epochs = range(1, len(train_losses) + 1)
+    ax.plot(epochs, train_losses, label="Train Loss", color="#2196F3", linewidth=1.5)
+    if val_losses:
+        ax.plot(epochs, val_losses, label="Val Loss", color="#FF9800", linewidth=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE Loss")
+    ax.set_title(f"Training Loss — {scenario}")
+    ax.legend()
+    ax.set_yscale("log")
+    fig.tight_layout()
+    fig.savefig(PLOTS_DIR / f"{scenario}_decomp_loss.png", dpi=150)
+    plt.close(fig)
+
+
+def _save_decomp_results_csv(scenario, channel_names, n_periods, r2, rmse,
+                              true_decomp, pred_contrib, pred_shares, true_shares):
+    """Save decomposition results to CSV."""
+    import csv
+    from demantiq.orchestration.training_format import DECOMP_IDX_CHANNELS_START
+
+    RESULTS_DIR = OUTPUT_DIR / "results"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Per-channel summary
+    path = RESULTS_DIR / f"{scenario}_decomp_channels.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["scenario", "channel", "true_total_contrib", "pred_total_contrib",
+                     "error_pct", "mean_true_share", "mean_pred_share", "share_mse"])
+        for i, ch in enumerate(channel_names):
+            idx = DECOMP_IDX_CHANNELS_START + i
+            true_total = np.sum(true_decomp[:, idx])
+            pred_total = np.sum(pred_contrib[:, idx])
+            err = abs(pred_total - true_total) / max(abs(true_total), 1.0) * 100
+            ts_mean = np.mean(true_shares[:, idx])
+            ps_mean = np.mean(pred_shares[:, idx])
+            mse = np.mean((true_shares[:, idx] - pred_shares[:, idx]) ** 2)
+            w.writerow([scenario, ch, f"{true_total:.1f}", f"{pred_total:.1f}",
+                       f"{err:.2f}", f"{ts_mean:.6f}", f"{ps_mean:.6f}", f"{mse:.8f}"])
+
+    # Summary
+    summary_path = RESULTS_DIR / f"{scenario}_decomp_summary.csv"
+    with open(summary_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["scenario", "n_channels", "n_periods", "r2", "rmse"])
+        w.writerow([scenario, len(channel_names), n_periods, f"{r2:.6f}", f"{rmse:.2f}"])
+
+    logger.info("Decomposition results saved: %s, %s", path.name, summary_path.name)
+
+
 def evaluate_scenario(engine, scenario_name: str):
     """Run inference on a named scenario and plot comparison with ground truth."""
     from demantiq.scenarios.scenario_library import ScenarioLibrary
@@ -1067,10 +1527,52 @@ def main():
                         help="Number of sequential rounds (default: 2)")
     parser.add_argument("--seq-sims", type=int, default=2000,
                         help="Simulations per sequential round (default: 2000)")
+    parser.add_argument("--decomposition", action="store_true",
+                        help="Use per-period decomposition engine (Phase A — supervised regression)")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate for decomposition engine (default: 1e-3)")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ---- Decomposition path (Phase A) ----
+    if args.decomposition:
+        if args.skip_training:
+            from demantiq.neural.decomposition_engine import DecompositionEngine, DecompositionConfig
+            config = DecompositionConfig(n_fixed_channels=args.fixed_channels)
+            engine = DecompositionEngine(config)
+            engine.load(str(DECOMP_MODEL_DIR))
+        else:
+            # Step 1: Generate training data (with per-period decomposition)
+            logger.info("=== Generating %d training simulations ===", args.n_train)
+            generate_training_data(args.n_train, n_fixed_channels=args.fixed_channels)
+
+            # Step 2: Train decomposition engine
+            logger.info("=== Training DECOMPOSITION engine (%d epochs) ===", args.n_epochs)
+            engine = train_decomposition_engine(
+                n_epochs=args.n_epochs,
+                n_train=args.n_train,
+                n_fixed_channels=args.fixed_channels,
+                learning_rate=args.lr,
+            )
+
+        # Step 3: Evaluate
+        if args.all_scenarios:
+            from demantiq.scenarios.scenario_library import ScenarioLibrary
+            for name in ScenarioLibrary.list_scenarios():
+                try:
+                    evaluate_decomposition(engine, name)
+                except Exception as e:
+                    logger.error("Failed on %s: %s", name, e)
+        else:
+            evaluate_decomposition(engine, args.scenario)
+
+        print(f"\nPlots saved to {PLOTS_DIR}/")
+        print(f"Results saved to {OUTPUT_DIR / 'results'}/")
+        print(f"Model saved to {DECOMP_MODEL_DIR}/")
+        return
+
+    # ---- SBI paths (monolithic / compositional) ----
     if args.skip_training:
         logger.info("Loading saved model from %s", MODEL_DIR)
         if args.compositional:

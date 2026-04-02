@@ -55,6 +55,7 @@ class TrainingPipeline:
         from demantiq.orchestration.training_format import (
             config_to_vector,
             extract_context_matrix,
+            ground_truth_to_decomposition,
             save_batch,
             summary_to_vector,
             summary_to_ext_vector,
@@ -117,6 +118,9 @@ class TrainingPipeline:
                         "truth_vector": summary_to_vector(result.summary_truth),
                         "ext_truth_vector": summary_to_ext_vector(
                             result.summary_truth, config
+                        ),
+                        "decomposition": ground_truth_to_decomposition(
+                            result.ground_truth, channel_names, config.n_periods
                         ),
                         "channel_names": channel_names,
                     }
