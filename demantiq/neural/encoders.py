@@ -389,11 +389,11 @@ class EmbeddingNetwork(nn.Module):
         n_channels: Tensor,
         channel_type_ids: Tensor,
         context: Tensor | None = None,
-    ) -> Tensor:
-        """Compute per-period embeddings preserving temporal dimension.
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute per-period features preserving temporal dimension and channel identity.
 
-        Instead of pooling across time, this produces one embedding per timestep
-        for use by the temporal decoder.
+        Returns per-channel features and global features SEPARATELY so the
+        decoder can process each channel individually (no position ambiguity).
 
         Args:
             y: (batch, T) outcome time series.
@@ -403,7 +403,9 @@ class EmbeddingNetwork(nn.Module):
             context: (batch, T, n_context_cols) business context matrix (optional).
 
         Returns:
-            (batch, T, temporal_embedding_dim) per-period embeddings.
+            ch_features: (batch, max_ch, channel_dim, T) per-channel temporal features.
+            global_features: (batch, global_dim, T) global context (y + ctx + n_ch).
+            channel_mask: (batch, max_ch) True for active channels.
         """
         batch_size = y.shape[0]
         T = y.shape[1]
@@ -430,22 +432,22 @@ class EmbeddingNetwork(nn.Module):
         # 2. Add channel-type embeddings (broadcast across time)
         type_emb = self.channel_type_embedding(channel_type_ids)  # (B, max_ch, type_dim)
         type_emb_t = type_emb.unsqueeze(-1).expand(-1, -1, -1, T_out)  # (B, max_ch, type_dim, T_out)
-        ch_combined = torch.cat([ch_temporal, type_emb_t], dim=2)  # (B, max_ch, channel_dim, T_out)
 
-        # 3. Aggregate channels per timestep
-        if self.n_fixed_channels is not None:
-            # Concatenate all per-channel features so decoder sees each channel individually
-            # ch_combined: (B, max_ch, channel_dim, T_out) → flatten channels
-            ch_combined = ch_combined * channel_mask.float().unsqueeze(-1).unsqueeze(-1)
-            # Take first n_fixed_channels and flatten: (B, n_fixed * channel_dim, T_out)
-            ch_agg = ch_combined[:, :self.n_fixed_channels].reshape(
-                batch_size, self.n_fixed_channels * self.channel_dim, T_out
+        # 3. Add raw normalized spend as explicit magnitude signal
+        # The CNN loses magnitude (cosine sim 0.987 for 10x spend difference).
+        # Pass the raw normalized spend so the decoder can see "this channel spends 0.39 vs 0.04".
+        spend_raw = spend_normed.permute(0, 2, 1)  # (B, max_ch, T)
+        # Handle T mismatch if CNN changes length
+        if spend_raw.shape[-1] != T_out:
+            spend_raw = nn.functional.interpolate(
+                spend_raw, size=T_out, mode="linear", align_corners=False,
             )
-        else:
-            # Fall back to masked mean (loses per-channel identity)
-            mask = channel_mask.float().unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
-            n_active = mask.sum(dim=1).clamp(min=1)  # (B, 1, 1)
-            ch_agg = (ch_combined * mask).sum(dim=1) / n_active  # (B, channel_dim, T_out)
+        spend_raw = spend_raw.unsqueeze(2)  # (B, max_ch, 1, T_out)
+
+        ch_combined = torch.cat([ch_temporal, type_emb_t, spend_raw], dim=2)  # (B, max_ch, channel_dim+1, T_out)
+
+        # 4. Zero out inactive channels
+        ch_combined = ch_combined * channel_mask.float().unsqueeze(-1).unsqueeze(-1)
 
         # 4. Y temporal features (no pooling) — normalize to prevent dying ReLU
         y_scale = y.abs().amax(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
@@ -462,15 +464,11 @@ class EmbeddingNetwork(nn.Module):
                 batch_size, self.temporal_dim, T_out, device=y.device
             )
 
-        # 6. n_channels broadcast to all timesteps
+        # 6. Build global context: y + ctx + n_channels
         n_ch_norm = (n_channels.float() / MAX_CHANNELS).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
         n_ch_t = n_ch_norm.expand(-1, -1, T_out)  # (B, 1, T_out)
+        global_features = torch.cat([y_temporal, ctx_temporal, n_ch_t], dim=1)  # (B, 129, T_out)
 
-        # 7. Concatenate per-timestep features
-        combined = torch.cat([ch_agg, y_temporal, ctx_temporal, n_ch_t], dim=1)  # (B, D_total, T_out)
-        combined = combined.permute(0, 2, 1)  # (B, T_out, D_total)
-
-        # 8. Project to embedding dim
-        temporal_emb = self.temporal_proj(combined)  # (B, T_out, temporal_embedding_dim)
-
-        return temporal_emb
+        # Return per-channel features and global features SEPARATELY
+        # The decoder processes each channel individually — no projection mixing
+        return ch_combined, global_features, channel_mask

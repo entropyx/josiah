@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 from demantiq.neural.data_loader import DemantiqDataset, create_dataloader
 from demantiq.neural.encoders import EmbeddingNetwork
 from demantiq.neural.losses import DecompositionLoss
-from demantiq.neural.temporal_decoder import TemporalDecoder
+from demantiq.neural.temporal_decoder import PerChannelTemporalDecoder
 from demantiq.orchestration.training_format import (
     DECOMP_COLS,
     DECOMP_IDX_BASELINE,
@@ -140,10 +140,15 @@ class DecompositionEngine:
             n_fixed_channels=self.config.n_fixed_channels,
         ).to(self.device)
 
-        self.decoder = TemporalDecoder(
-            input_dim=self.config.embedding_dim,
+        # channel_dim = temporal_dim + type_embed_dim + 1 (raw normalized spend)
+        channel_dim = self.config.temporal_dim + self.config.type_embed_dim + 1
+        # global_dim = temporal_dim (y) + temporal_dim (ctx) + 1 (n_channels)
+        global_dim = self.config.temporal_dim + self.config.temporal_dim + 1
+
+        self.decoder = PerChannelTemporalDecoder(
+            channel_dim=channel_dim,
+            global_dim=global_dim,
             hidden_dim=self.config.decoder_hidden_dim,
-            n_components=DECOMP_COLS,
             n_layers=self.config.decoder_n_layers,
             dropout=self.config.decoder_dropout,
         ).to(self.device)
@@ -314,23 +319,15 @@ class DecompositionEngine:
         decomposition = batch["decomposition"].to(self.device)
         n_periods = batch["n_periods"].to(self.device)
 
-        # Forward pass
-        temporal_emb = self.encoder.forward_temporal(
+        # Forward pass — returns per-channel features + global context separately
+        ch_features, global_features, channel_mask = self.encoder.forward_temporal(
             y, spend, n_channels, channel_type_ids, context,
         )
 
-        # Handle potential T mismatch (conv padding may change length)
-        T_emb = temporal_emb.shape[1]
-        T_data = y.shape[1]
-        if T_emb != T_data:
-            # Interpolate to match data length
-            temporal_emb = temporal_emb.permute(0, 2, 1)  # (B, D, T_emb)
-            temporal_emb = nn.functional.interpolate(
-                temporal_emb, size=T_data, mode="linear", align_corners=False,
-            )
-            temporal_emb = temporal_emb.permute(0, 2, 1)  # (B, T_data, D)
-
-        pred_shares = self.decoder(temporal_emb)  # (B, T, DECOMP_COLS)
+        # Decoder processes each channel individually
+        pred_shares = self.decoder(
+            ch_features, global_features, channel_mask, n_channels,
+        )  # (B, T, DECOMP_COLS)
 
         # Compute true shares from decomposition and y
         true_shares, valid_mask = _compute_true_shares(decomposition, y, n_periods)
@@ -364,19 +361,12 @@ class DecompositionEngine:
             decomposition = batch["decomposition"].to(self.device)
             n_periods = batch["n_periods"].to(self.device)
 
-            temporal_emb = self.encoder.forward_temporal(
+            ch_features, global_features, channel_mask = self.encoder.forward_temporal(
                 y, spend, n_channels, channel_type_ids, context,
             )
-            T_emb = temporal_emb.shape[1]
-            T_data = y.shape[1]
-            if T_emb != T_data:
-                temporal_emb = temporal_emb.permute(0, 2, 1)
-                temporal_emb = nn.functional.interpolate(
-                    temporal_emb, size=T_data, mode="linear", align_corners=False,
-                )
-                temporal_emb = temporal_emb.permute(0, 2, 1)
-
-            pred_shares = self.decoder(temporal_emb)
+            pred_shares = self.decoder(
+                ch_features, global_features, channel_mask, n_channels,
+            )
             true_shares, valid_mask = _compute_true_shares(decomposition, y, n_periods)
 
             loss, _ = self.loss_fn(pred_shares, true_shares, valid_mask, n_channels)
@@ -423,19 +413,12 @@ class DecompositionEngine:
         type_ids_t = torch.from_numpy(channel_type_ids).long().unsqueeze(0).to(self.device)
 
         # Forward
-        temporal_emb = self.encoder.forward_temporal(
+        ch_features, global_features, channel_mask = self.encoder.forward_temporal(
             y_t, spend_t, n_ch_t, type_ids_t, ctx_t,
         )
-        T_emb = temporal_emb.shape[1]
-        T_data = y_t.shape[1]
-        if T_emb != T_data:
-            temporal_emb = temporal_emb.permute(0, 2, 1)
-            temporal_emb = nn.functional.interpolate(
-                temporal_emb, size=T_data, mode="linear", align_corners=False,
-            )
-            temporal_emb = temporal_emb.permute(0, 2, 1)
-
-        pred_shares = self.decoder(temporal_emb)  # (1, T, DECOMP_COLS)
+        pred_shares = self.decoder(
+            ch_features, global_features, channel_mask, n_ch_t,
+        )  # (1, T, DECOMP_COLS)
         shares = pred_shares.squeeze(0).cpu().numpy()  # (T, DECOMP_COLS)
 
         # Compute absolute contributions
