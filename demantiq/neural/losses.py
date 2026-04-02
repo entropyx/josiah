@@ -94,6 +94,7 @@ class DecompositionLoss(nn.Module):
         l_total = self._total_contribution_loss(pred, true, valid_mask, comp_mask)
         l_category = self._category_loss(pred, true, valid_mask, n_channels)
         l_rank = self._ranking_loss(pred, true, valid_mask, n_channels)
+        l_sum = self._sum_loss(pred, valid_mask, comp_mask)
 
         # Running-mean normalization: each term ÷ its own EMA → all ≈ 1.0
         # Not learnable — model can't game this.
@@ -119,7 +120,7 @@ class DecompositionLoss(nn.Module):
         norm_cat = l_category / self.ema_category.clamp(min=1e-8)
         norm_rank = l_rank / self.ema_rank.clamp(min=1e-8)
 
-        total = norm_share + norm_total + norm_cat + norm_rank + self.zero_reg_weight * l_zero
+        total = norm_share + norm_total + norm_cat + norm_rank + self.zero_reg_weight * l_zero + 0.1 * l_sum
 
         loss_dict = {
             "L_share": l_share.detach(),
@@ -127,6 +128,7 @@ class DecompositionLoss(nn.Module):
             "L_category": l_category.detach(),
             "L_rank": l_rank.detach(),
             "L_zero": l_zero.detach(),
+            "L_sum": l_sum.detach(),
             "ema_share": self.ema_share.clone(),
             "ema_total": self.ema_total.clone(),
             "ema_cat": self.ema_category.clone(),
@@ -172,6 +174,19 @@ class DecompositionLoss(nn.Module):
         im = inactive_mask.float()
         n_inactive = im.sum().clamp(min=1)
         return (pred ** 2 * im).sum() / n_inactive
+
+    def _sum_loss(
+        self, pred: Tensor, valid_mask: Tensor, comp_mask: Tensor
+    ) -> Tensor:
+        """Penalize when active shares don't sum to ~1.0 per timestep (additivity)."""
+        # Sum active component shares per timestep
+        full_mask = comp_mask.unsqueeze(1).float()  # (B, 1, C)
+        active_sum = (pred * full_mask).sum(dim=-1)  # (B, T)
+        # Should be ~1.0 for valid timesteps
+        vm = valid_mask.float()
+        diff = (active_sum - 1.0) * vm
+        n_valid = vm.sum().clamp(min=1)
+        return (diff ** 2).sum() / n_valid
 
     def _total_contribution_loss(
         self, pred: Tensor, true: Tensor, valid_mask: Tensor, comp_mask: Tensor
