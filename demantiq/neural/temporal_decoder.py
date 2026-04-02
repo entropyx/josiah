@@ -1,18 +1,18 @@
-"""NAM (Neural Additive Model) decoder for per-period demand decomposition.
+"""Additive Neural Decomposition decoder.
 
-Each demand component gets a dedicated sub-network that sees the FULL time series:
-- Channel CNN: sees channel_spend + y + context + type_embedding → learns spend↔y relationship
-- Baseline CNN: sees y + context → learns organic demand patterns
-- Other CNN: sees y + context → learns price, competition, macro, noise
+Each demand component gets a dedicated CNN sub-network that predicts its
+ABSOLUTE contribution (in demand units, not shares). Components are summed
+to reconstruct y. Loss is on both individual components and reconstruction.
 
-The key insight: the channel CNN processes spend AND y together across all timesteps,
-so it can learn "when this channel spends more, y goes up proportionally" — i.e.,
-it can estimate channel effectiveness (beta) from the observable data.
+Key design: channel sub-networks see ONLY their own spend — not y.
+This prevents the CNN from shortcutting by predicting y/n_channels.
 
-Architecture based on:
-- Neural Additive Models (Agarwal et al., ICML 2021)
-- N-BEATS additive decomposition (Oreshkin et al., ICLR 2020)
-- Google NNN for MMM (April 2025)
+Architecture:
+- channel_cnn: spend_i + type_emb + global_stats → contribution_i(T)
+- baseline_cnn: context → baseline(T)
+- other_cnn: context → price_effect(T), competition_effect(T), macro_effect(T)
+
+Based on: NAMs (ICML 2021), N-BEATS (ICLR 2020), Google NNN (2025)
 """
 
 from __future__ import annotations
@@ -34,13 +34,12 @@ from demantiq.orchestration.training_format import (
     MAX_CONTEXT_COLS,
 )
 
+# Number of global summary stats passed to channel CNN
+N_GLOBAL_STATS = 4  # mean_y, mean_total_spend, y_spend_ratio, n_channels
+
 
 def _build_dilated_cnn(in_channels: int, out_channels: int, hidden: int = 64) -> nn.Sequential:
-    """Build a dilated CNN that preserves temporal dimension.
-
-    3 dilated layers (receptive field ~31 timesteps) + 1x1 projection.
-    Same padding scheme as the proven DilatedConv1DEncoder.
-    """
+    """Dilated CNN preserving temporal dimension. Receptive field ~31 timesteps."""
     return nn.Sequential(
         nn.Conv1d(in_channels, hidden, kernel_size=7, padding=3, dilation=1),
         nn.LeakyReLU(0.01),
@@ -52,13 +51,8 @@ def _build_dilated_cnn(in_channels: int, out_channels: int, hidden: int = 64) ->
     )
 
 
-class NAMTemporalDecoder(nn.Module):
-    """Neural Additive Model decoder for demand decomposition.
-
-    Three sub-networks, each seeing the full time series:
-        1. channel_cnn: per-channel contribution (shared weights, type-conditioned)
-        2. baseline_cnn: organic baseline
-        3. other_cnn: price, competition, macro, noise
+class AdditiveDecompositionDecoder(nn.Module):
+    """Additive decoder: predict absolute contributions, sum to reconstruct y.
 
     Args:
         n_context_cols: Number of business context columns.
@@ -76,97 +70,108 @@ class NAMTemporalDecoder(nn.Module):
     ):
         super().__init__()
         self.type_embed_dim = type_embed_dim
-        self.n_context_cols = n_context_cols
 
-        # Channel type embeddings (learned, conditions shared CNN per channel type)
+        # Channel type embeddings
         self.channel_type_embedding = nn.Embedding(n_channel_types, type_embed_dim)
 
-        # Channel CNN: spend(1) + y(1) + context(n_ctx) + type_emb(16) → 1 share
-        channel_in = 1 + 1 + n_context_cols + type_embed_dim
+        # Channel CNN: spend(1) + type_emb(16) + global_stats(4) → contribution(1)
+        # NO y input — forces learning actual spend→contribution transformation
+        channel_in = 1 + type_embed_dim + N_GLOBAL_STATS
         self.channel_cnn = _build_dilated_cnn(channel_in, 1, hidden_dim)
 
-        # Baseline CNN: y(1) + context(n_ctx) → 1 share
-        baseline_in = 1 + n_context_cols
+        # Baseline CNN: context(n_ctx) + time_index(1) → baseline(1)
+        # NO y, NO spend — baseline is organic demand
+        baseline_in = n_context_cols + 1
         self.baseline_cnn = _build_dilated_cnn(baseline_in, 1, hidden_dim)
 
-        # Other CNN: y(1) + context(n_ctx) → 4 shares (price, competition, macro, noise)
-        other_in = 1 + n_context_cols
-        self.other_cnn = _build_dilated_cnn(other_in, 4, hidden_dim)
+        # Other CNN: context(n_ctx) + time_index(1) → price(1) + competition(1) + macro(1)
+        other_in = n_context_cols + 1
+        self.other_cnn = _build_dilated_cnn(other_in, 3, hidden_dim)
 
     def forward(
         self,
-        spend_normed: Tensor,
-        y_normed: Tensor,
-        ctx_normed: Tensor,
+        spend: Tensor,
+        context: Tensor,
         channel_type_ids: Tensor,
         channel_mask: Tensor,
         n_channels: Tensor,
-    ) -> Tensor:
-        """Predict per-period component shares using NAM architecture.
+        global_stats: Tensor,
+    ) -> dict[str, Tensor]:
+        """Predict absolute per-component contributions.
 
         Args:
-            spend_normed: (B, T, max_ch) normalized spend matrix.
-            y_normed: (B, T) normalized outcome.
-            ctx_normed: (B, T, n_ctx) normalized context.
+            spend: (B, T, max_ch) raw spend (NOT normalized — we normalize here).
+            context: (B, T, n_ctx) business context.
             channel_type_ids: (B, max_ch) channel type indices.
             channel_mask: (B, max_ch) True for active channels.
             n_channels: (B,) number of active channels.
+            global_stats: (B, N_GLOBAL_STATS) scenario-level summary statistics.
 
         Returns:
-            (B, T, DECOMP_COLS) predicted shares for all components.
+            Dict with:
+                contributions: (B, T, DECOMP_COLS) per-component absolute contributions
+                y_pred: (B, T) reconstructed y = sum of all components
         """
-        B, T, max_ch = spend_normed.shape
-        device = spend_normed.device
+        B, T, max_ch = spend.shape
+        device = spend.device
 
-        # --- Channel contributions (batched across all channels) ---
-        # Get type embeddings: (B, max_ch, type_embed_dim)
-        type_emb = self.channel_type_embedding(channel_type_ids[:, :max_ch])
+        # Normalize spend per channel (by global max across all channels)
+        spend_scale = spend.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1.0)
+        spend_normed = spend / spend_scale  # (B, T, max_ch), in [-1, 1]
 
-        # Build per-channel input: (B, max_ch, T, 1+1+n_ctx+16)
-        # spend_i(T,1) + y(T,1) + context(T,n_ctx) + type_emb(T,16)
-        y_expanded = y_normed.unsqueeze(2).expand(-1, -1, max_ch)  # (B, T, max_ch)
-        # Rearrange: (B, max_ch, T)
+        # --- Channel contributions ---
+        type_emb = self.channel_type_embedding(channel_type_ids[:, :max_ch])  # (B, max_ch, 16)
+
+        # Build per-channel input: spend(1) + type_emb(16) + global_stats(4)
         spend_ch = spend_normed.permute(0, 2, 1)  # (B, max_ch, T)
-        y_ch = y_expanded.permute(0, 2, 1)  # (B, max_ch, T)
-        ctx_ch = ctx_normed.unsqueeze(1).expand(-1, max_ch, -1, -1)  # (B, max_ch, T, n_ctx)
-        ctx_ch = ctx_ch.permute(0, 1, 3, 2)  # (B, max_ch, n_ctx, T)
-        type_emb_ch = type_emb.unsqueeze(-1).expand(-1, -1, -1, T)  # (B, max_ch, 16, T)
+        type_emb_t = type_emb.unsqueeze(-1).expand(-1, -1, -1, T)  # (B, max_ch, 16, T)
+        global_t = global_stats.unsqueeze(-1).unsqueeze(1).expand(-1, max_ch, -1, T)  # (B, max_ch, 4, T)
 
-        # Concatenate along feature dim: (B, max_ch, 1+1+n_ctx+16, T)
         ch_input = torch.cat([
             spend_ch.unsqueeze(2),  # (B, max_ch, 1, T)
-            y_ch.unsqueeze(2),      # (B, max_ch, 1, T)
-            ctx_ch,                 # (B, max_ch, n_ctx, T)
-            type_emb_ch,            # (B, max_ch, 16, T)
-        ], dim=2)
+            type_emb_t,             # (B, max_ch, 16, T)
+            global_t,               # (B, max_ch, 4, T)
+        ], dim=2)  # (B, max_ch, 21, T)
 
-        # Flatten batch and channel dims for batched CNN: (B*max_ch, features, T)
+        # Batch all channels: (B*max_ch, 21, T)
         ch_input_flat = ch_input.reshape(B * max_ch, -1, T)
-        ch_shares_flat = self.channel_cnn(ch_input_flat)  # (B*max_ch, 1, T)
-        ch_shares = ch_shares_flat.reshape(B, max_ch, T)  # (B, max_ch, T)
+        ch_contrib_flat = self.channel_cnn(ch_input_flat)  # (B*max_ch, 1, T)
+        ch_contribs = ch_contrib_flat.reshape(B, max_ch, T)  # (B, max_ch, T)
 
         # Mask inactive channels
-        ch_shares = ch_shares * channel_mask.unsqueeze(-1).float()
+        ch_contribs = ch_contribs * channel_mask.unsqueeze(-1).float()
+
+        # Scale contributions back to demand units
+        # The CNN outputs in normalized space; multiply by spend_scale to get demand units
+        # spend_scale is (B, 1, 1), squeeze to (B,) and broadcast
+        ch_contribs = ch_contribs * spend_scale.reshape(B, 1, 1)  # (B, max_ch, T)
 
         # --- Baseline ---
-        # Input: y(1) + context(n_ctx) → (B, 1+n_ctx, T)
-        base_input = torch.cat([
-            y_normed.unsqueeze(1),           # (B, 1, T)
-            ctx_normed.permute(0, 2, 1),     # (B, n_ctx, T)
-        ], dim=1)
-        baseline_share = self.baseline_cnn(base_input).squeeze(1)  # (B, T)
+        # time_index as a feature (normalized 0-1)
+        time_idx = torch.linspace(0, 1, T, device=device).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+        time_idx = time_idx.expand(B, -1, -1)  # (B, 1, T)
+        ctx_t = context.permute(0, 2, 1)  # (B, n_ctx, T)
+        base_input = torch.cat([ctx_t, time_idx], dim=1)  # (B, n_ctx+1, T)
 
-        # --- Other components (price, competition, macro, noise) ---
-        other_shares = self.other_cnn(base_input)  # (B, 4, T)
+        baseline = self.baseline_cnn(base_input).squeeze(1)  # (B, T)
 
-        # --- Assemble output: (B, T, DECOMP_COLS) ---
-        output = torch.zeros(B, T, DECOMP_COLS, device=device)
-        output[:, :, DECOMP_IDX_BASELINE] = baseline_share
-        output[:, :, DECOMP_IDX_CHANNELS_START:DECOMP_IDX_CHANNELS_START + max_ch] = ch_shares.permute(0, 2, 1)
-        output[:, :, DECOMP_IDX_PRICE] = other_shares[:, 0, :]
-        output[:, :, DECOMP_IDX_COMPETITION] = other_shares[:, 1, :]
-        output[:, :, DECOMP_IDX_MACRO] = other_shares[:, 2, :]
-        output[:, :, DECOMP_IDX_NOISE] = other_shares[:, 3, :]
-        # Distribution cap stays 0 (multiplicative, excluded from training)
+        # --- Other components (price, competition, macro) ---
+        other = self.other_cnn(base_input)  # (B, 3, T)
 
-        return output
+        # --- Assemble contributions ---
+        contributions = torch.zeros(B, T, DECOMP_COLS, device=device)
+        contributions[:, :, DECOMP_IDX_BASELINE] = baseline
+        contributions[:, :, DECOMP_IDX_CHANNELS_START:DECOMP_IDX_CHANNELS_START + max_ch] = ch_contribs.permute(0, 2, 1)
+        contributions[:, :, DECOMP_IDX_PRICE] = other[:, 0, :]
+        contributions[:, :, DECOMP_IDX_COMPETITION] = other[:, 1, :]
+        contributions[:, :, DECOMP_IDX_MACRO] = other[:, 2, :]
+        # Noise is the residual (not predicted)
+        # Distribution cap stays 0
+
+        # Reconstruct y
+        y_pred = baseline + ch_contribs.sum(dim=1) + other.sum(dim=1)  # (B, T)
+
+        return {
+            "contributions": contributions,
+            "y_pred": y_pred,
+        }

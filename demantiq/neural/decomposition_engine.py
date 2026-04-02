@@ -1,14 +1,8 @@
-"""Decomposition inference engine — supervised regression for per-period demand decomposition.
+"""Additive decomposition engine — predict absolute contributions, sum to reconstruct y.
 
-Replaces the SBI/NSF approach with a standard PyTorch encoder-decoder that predicts
-weekly demand component shares directly. Trained on simulator-generated per-period
-ground truth.
-
-Pipeline:
-    1. EmbeddingNetwork.forward_temporal() → per-period embeddings (B, T, 256)
-    2. TemporalDecoder → per-period component shares (B, T, 26)
-    3. Loss: MSE between predicted shares and true shares from ground_truth
-    4. Inference: multiply predicted shares × observed y → absolute contributions
+Each component sub-network sees only its own inputs (spend for channels,
+context for baseline). No y pollution. Components are summed and compared
+to actual y. Loss is on both per-component accuracy and reconstruction.
 """
 
 from __future__ import annotations
@@ -23,14 +17,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from demantiq.neural.data_loader import DemantiqDataset, create_dataloader
-from demantiq.neural.losses import DecompositionLoss
-from demantiq.neural.temporal_decoder import NAMTemporalDecoder
+from demantiq.neural.data_loader import DemantiqDataset
+from demantiq.neural.losses import AdditiveDecompositionLoss
+from demantiq.neural.temporal_decoder import AdditiveDecompositionDecoder, N_GLOBAL_STATS
 from demantiq.orchestration.training_format import (
     DECOMP_COLS,
     DECOMP_IDX_BASELINE,
     DECOMP_IDX_CHANNELS_START,
-    DECOMP_IDX_CHANNELS_END,
     DECOMP_IDX_DISTRIBUTION,
     DECOMP_IDX_NOISE,
 )
@@ -40,18 +33,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DecompositionConfig:
-    """Configuration for the decomposition engine."""
-
-    # Encoder
-    temporal_dim: int = 64
-    type_embed_dim: int = 16
-    n_attn_heads: int = 4
-    n_attn_layers: int = 2
-    embedding_dim: int = 256
-
+    """Configuration for the additive decomposition engine."""
     # Decoder
-    decoder_hidden_dim: int = 128
-    decoder_n_layers: int = 2
+    type_embed_dim: int = 16
+    decoder_hidden_dim: int = 64
     decoder_dropout: float = 0.1
 
     # Training
@@ -59,7 +44,7 @@ class DecompositionConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     n_epochs: int = 50
-    patience: int = 10
+    patience: int = 15
     val_fraction: float = 0.1
     grad_clip: float = 1.0
 
@@ -68,96 +53,61 @@ class DecompositionConfig:
     data_dir: str = "training_data"
     n_fixed_channels: int | None = None
 
-    # Composite loss
+    # Legacy fields (kept for config compatibility)
+    temporal_dim: int = 64
+    n_attn_heads: int = 4
+    n_attn_layers: int = 2
+    embedding_dim: int = 256
+    decoder_n_layers: int = 2
     ranking_margin: float = 0.0
 
 
-def _compute_true_shares(
-    decomposition: torch.Tensor,
-    y: torch.Tensor,
-    n_periods: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert absolute decomposition values to fractional shares.
-
-    Handles the distribution_cap column specially since it's multiplicative
-    (stored as raw multiplier ~0.8-1.0), not an additive component.
+def _compute_global_stats(y: torch.Tensor, spend: torch.Tensor, n_channels: torch.Tensor) -> torch.Tensor:
+    """Compute scenario-level summary statistics for the channel CNN.
 
     Args:
-        decomposition: (B, T, DECOMP_COLS) raw component values.
-        y: (B, T) observed demand.
-        n_periods: (B,) valid period counts.
+        y: (B, T) demand.
+        spend: (B, T, max_ch) spend.
+        n_channels: (B,) active channel count.
 
     Returns:
-        shares: (B, T, DECOMP_COLS) fractional shares.
-        valid_mask: (B, T) True for valid (non-padded) timesteps.
+        (B, N_GLOBAL_STATS) summary stats.
     """
-    B, T, C = decomposition.shape
+    B = y.shape[0]
+    stats = torch.zeros(B, N_GLOBAL_STATS, device=y.device)
 
-    # Build valid timestep mask
-    t_idx = torch.arange(T, device=y.device).unsqueeze(0)  # (1, T)
-    valid_mask = t_idx < n_periods.unsqueeze(1)  # (B, T)
+    mean_y = y.mean(dim=1)  # (B,)
+    total_spend = spend.sum(dim=2)  # (B, T) — sum across channels
+    mean_total_spend = total_spend.mean(dim=1)  # (B,)
 
-    # Compute shares: component / y (where y != 0)
-    y_safe = y.unsqueeze(-1).clamp(min=1.0)  # (B, T, 1) — avoid div by zero
-    shares = decomposition / y_safe  # (B, T, C)
+    stats[:, 0] = mean_y / mean_y.abs().max().clamp(min=1)  # normalized mean_y
+    stats[:, 1] = mean_total_spend / mean_total_spend.abs().max().clamp(min=1)  # normalized mean_spend
+    stats[:, 2] = (mean_y / mean_total_spend.clamp(min=1)).clamp(-10, 10)  # y/spend ratio
+    stats[:, 3] = n_channels.float() / 20.0  # normalized n_channels
 
-    # Clip extreme share values — outlier samples with small y produce huge shares
-    # that dominate the MSE loss. Valid shares are typically in [-0.5, 1.5].
-    shares = shares.clamp(-2.0, 2.0)
-
-    # Distribution cap is multiplicative, not additive — set its share to 0
-    # (the decoder should learn to ignore this slot, or we mask it in the loss)
-    shares[:, :, DECOMP_IDX_DISTRIBUTION] = 0.0
-
-    # Zero out padded timesteps
-    shares = shares * valid_mask.unsqueeze(-1).float()
-
-    return shares, valid_mask
+    return stats
 
 
 class DecompositionEngine:
-    """Training and inference engine for per-period demand decomposition.
-
-    Uses the EmbeddingNetwork (temporal mode) + TemporalDecoder to predict
-    weekly demand component shares from observable data.
-
-    Args:
-        config: DecompositionConfig with all hyperparameters.
-    """
+    """Training and inference engine for additive demand decomposition."""
 
     def __init__(self, config: DecompositionConfig | None = None):
         self.config = config or DecompositionConfig()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # NAM decoder: each component gets its own CNN sub-network
-        # No encoder needed — NAM processes raw inputs directly
-        self.decoder = NAMTemporalDecoder(
+        self.decoder = AdditiveDecompositionDecoder(
             type_embed_dim=self.config.type_embed_dim,
             hidden_dim=self.config.decoder_hidden_dim,
         ).to(self.device)
 
-        self.loss_fn = DecompositionLoss(
-            ranking_margin=self.config.ranking_margin,
-        ).to(self.device)
+        self.loss_fn = AdditiveDecompositionLoss().to(self.device)
 
         self.optimizer: torch.optim.Optimizer | None = None
         self.train_losses: list[float] = []
         self.val_losses: list[float] = []
 
-    def train(
-        self,
-        data_dir: str | None = None,
-        n_train: int | None = None,
-    ) -> dict:
-        """Train the encoder-decoder on per-period decomposition data.
-
-        Args:
-            data_dir: Directory containing .npz training batches.
-            n_train: Max number of training samples to use.
-
-        Returns:
-            Dict with training metrics (final loss, best val loss, etc.)
-        """
+    def train(self, data_dir: str | None = None, n_train: int | None = None) -> dict:
+        """Train the additive decomposition model."""
         data_dir = data_dir or self.config.data_dir
         n_train = n_train or self.config.n_train
 
@@ -165,13 +115,10 @@ class DecompositionEngine:
         dataset = DemantiqDataset(data_dir, max_samples=n_train)
         logger.info("Loaded %d samples", len(dataset))
 
-        # Check that decomposition data exists
+        # Check decomposition data exists
         sample = dataset[0]
         if sample["decomposition"].abs().sum() == 0:
-            raise ValueError(
-                "Decomposition data is all zeros. Regenerate training data "
-                "with the updated pipeline that saves per-period ground truth."
-            )
+            raise ValueError("Decomposition data is all zeros. Regenerate training data.")
 
         # Split train/val
         n_val = max(1, int(len(dataset) * self.config.val_fraction))
@@ -190,10 +137,10 @@ class DecompositionEngine:
             num_workers=0, pin_memory=self.device.type == "cuda",
         )
 
-        # Optimizer (only decoder — NAM has no separate encoder)
-        params = list(self.decoder.parameters())
         self.optimizer = torch.optim.AdamW(
-            params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay,
+            self.decoder.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6,
@@ -211,9 +158,7 @@ class DecompositionEngine:
 
         t_start = time.time()
         for epoch in range(self.config.n_epochs):
-            # --- Train ---
             self.decoder.train()
-            self.loss_fn.train()
             epoch_loss = 0.0
             epoch_terms: dict[str, float] = {}
             n_batches = 0
@@ -229,7 +174,6 @@ class DecompositionEngine:
             avg_terms = {k: v / max(n_batches, 1) for k, v in epoch_terms.items()}
             self.train_losses.append(avg_train_loss)
 
-            # --- Validate ---
             val_loss = self._validate(val_loader)
             self.val_losses.append(val_loss)
             scheduler.step(val_loss)
@@ -238,25 +182,19 @@ class DecompositionEngine:
             elapsed = time.time() - t_start
 
             if epoch % 5 == 0 or epoch == self.config.n_epochs - 1:
-                ls = avg_terms.get("L_share", 0)
-                lt = avg_terms.get("L_total", 0)
-                lc = avg_terms.get("L_category", 0)
-                lr_val = avg_terms.get("L_rank", 0)
+                lc = avg_terms.get("L_component", 0)
+                lr_val = avg_terms.get("L_reconstruction", 0)
                 logger.info(
                     "Epoch %3d/%d  loss=%.4f  val=%.4f  "
-                    "L_sh=%.4f L_tot=%.4f L_cat=%.4f L_rk=%.4f  "
-                    "lr=%.1e  [%.0fs]",
+                    "L_comp=%.4f L_recon=%.4f  lr=%.1e  [%.0fs]",
                     epoch + 1, self.config.n_epochs, avg_train_loss, val_loss,
-                    ls, lt, lc, lr_val,
-                    current_lr, elapsed,
+                    lc, lr_val, current_lr, elapsed,
                 )
 
-            # Early stopping
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_state = {
                     "decoder": {k: v.cpu().clone() for k, v in self.decoder.state_dict().items()},
-                    "loss_fn": {k: v.cpu().clone() for k, v in self.loss_fn.state_dict().items()},
                 }
                 patience_counter = 0
             else:
@@ -265,19 +203,12 @@ class DecompositionEngine:
                     logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, self.config.patience)
                     break
 
-        # Restore best model
         if best_state is not None:
             self.decoder.load_state_dict(best_state["decoder"])
-            if "loss_fn" in best_state:
-                self.loss_fn.load_state_dict(best_state["loss_fn"])
             self.decoder.to(self.device)
-            self.loss_fn.to(self.device)
 
         total_time = time.time() - t_start
-        logger.info(
-            "Training complete: %.1f minutes, best_val_loss=%.6f",
-            total_time / 60, best_val_loss,
-        )
+        logger.info("Training complete: %.1f minutes, best_val_loss=%.6f", total_time / 60, best_val_loss)
 
         return {
             "best_val_loss": best_val_loss,
@@ -286,8 +217,7 @@ class DecompositionEngine:
             "training_time_minutes": total_time / 60,
         }
 
-    def _train_step(self, batch: dict) -> float:
-        """Single training step on a batch."""
+    def _train_step(self, batch: dict) -> tuple[float, dict]:
         self.optimizer.zero_grad()
 
         y = batch["y"].to(self.device)
@@ -295,33 +225,34 @@ class DecompositionEngine:
         context = batch["context"].to(self.device)
         n_channels = batch["n_channels"].to(self.device)
         channel_type_ids = batch["channel_type_ids"].to(self.device)
-        decomposition = batch["decomposition"].to(self.device)
+        decomposition = batch["decomposition"].to(self.device)  # true absolute contributions
         n_periods = batch["n_periods"].to(self.device)
 
-        # Normalize raw inputs (NAM processes these directly, no encoder)
-        spend_scale = spend.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1.0)
-        spend_normed = spend / spend_scale
-        y_scale = y.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
-        y_normed = y / y_scale
-        ctx_scale = context.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
-        ctx_normed = context / ctx_scale
+        # Build valid mask
+        T = y.shape[1]
+        t_idx = torch.arange(T, device=self.device).unsqueeze(0)
+        valid_mask = t_idx < n_periods.unsqueeze(1)
 
         # Build channel mask
         max_ch = spend.shape[2]
-        ch_indices = torch.arange(max_ch, device=n_channels.device).unsqueeze(0)
-        channel_mask = ch_indices < n_channels.unsqueeze(1)
+        ch_idx = torch.arange(max_ch, device=self.device).unsqueeze(0)
+        channel_mask = ch_idx < n_channels.unsqueeze(1)
 
-        # NAM decoder: each component sees full time series
-        pred_shares = self.decoder(
-            spend_normed, y_normed, ctx_normed,
-            channel_type_ids[:, :max_ch], channel_mask, n_channels,
-        )  # (B, T, DECOMP_COLS)
+        # Compute global stats
+        global_stats = _compute_global_stats(y, spend, n_channels)
 
-        # Compute true shares from decomposition and y
-        true_shares, valid_mask = _compute_true_shares(decomposition, y, n_periods)
+        # Forward
+        result = self.decoder(
+            spend, context, channel_type_ids[:, :max_ch],
+            channel_mask, n_channels, global_stats,
+        )
 
-        # Composite loss
-        loss, loss_terms = self.loss_fn(pred_shares, true_shares, valid_mask, n_channels)
+        # Loss
+        loss, loss_terms = self.loss_fn(
+            result["contributions"], decomposition,
+            result["y_pred"], y,
+            valid_mask, n_channels,
+        )
 
         loss.backward()
         if self.config.grad_clip > 0:
@@ -332,9 +263,7 @@ class DecompositionEngine:
 
     @torch.no_grad()
     def _validate(self, val_loader: DataLoader) -> float:
-        """Compute validation loss."""
         self.decoder.eval()
-
         total_loss = 0.0
         n_batches = 0
 
@@ -347,24 +276,23 @@ class DecompositionEngine:
             decomposition = batch["decomposition"].to(self.device)
             n_periods = batch["n_periods"].to(self.device)
 
-            spend_scale = spend.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1.0)
-            spend_normed = spend / spend_scale
-            y_scale = y.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
-            y_normed = y / y_scale
-            ctx_scale = context.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
-            ctx_normed = context / ctx_scale
+            T = y.shape[1]
+            t_idx = torch.arange(T, device=self.device).unsqueeze(0)
+            valid_mask = t_idx < n_periods.unsqueeze(1)
             max_ch = spend.shape[2]
-            ch_indices = torch.arange(max_ch, device=n_channels.device).unsqueeze(0)
-            channel_mask = ch_indices < n_channels.unsqueeze(1)
+            ch_idx = torch.arange(max_ch, device=self.device).unsqueeze(0)
+            channel_mask = ch_idx < n_channels.unsqueeze(1)
+            global_stats = _compute_global_stats(y, spend, n_channels)
 
-            pred_shares = self.decoder(
-                spend_normed, y_normed, ctx_normed,
-                channel_type_ids[:, :max_ch], channel_mask, n_channels,
+            result = self.decoder(
+                spend, context, channel_type_ids[:, :max_ch],
+                channel_mask, n_channels, global_stats,
             )
-            true_shares, valid_mask = _compute_true_shares(decomposition, y, n_periods)
-
-            loss, _ = self.loss_fn(pred_shares, true_shares, valid_mask, n_channels)
-
+            loss, _ = self.loss_fn(
+                result["contributions"], decomposition,
+                result["y_pred"], y,
+                valid_mask, n_channels,
+            )
             total_loss += loss.item()
             n_batches += 1
 
@@ -372,91 +300,60 @@ class DecompositionEngine:
 
     @torch.no_grad()
     def infer(
-        self,
-        y: np.ndarray,
-        spend: np.ndarray,
-        context: np.ndarray,
-        n_channels: int,
-        channel_type_ids: np.ndarray,
-        n_periods: int,
+        self, y: np.ndarray, spend: np.ndarray, context: np.ndarray,
+        n_channels: int, channel_type_ids: np.ndarray, n_periods: int,
     ) -> dict:
         """Run inference on a single scenario.
 
-        Args:
-            y: (T,) observed demand.
-            spend: (T, max_channels) spend matrix.
-            context: (T, n_context_cols) context matrix.
-            n_channels: Number of active channels.
-            channel_type_ids: (max_channels,) channel type indices.
-            n_periods: Number of valid periods.
-
-        Returns:
-            Dict with:
-                shares: (T, DECOMP_COLS) predicted fractional shares.
-                contributions: (T, DECOMP_COLS) absolute contributions (shares × y).
-                y_reconstructed: (T,) sum of additive contributions.
+        Returns absolute contributions (not shares).
         """
         self.decoder.eval()
 
-        # Convert to tensors with batch dim
-        y_t = torch.from_numpy(y).float().unsqueeze(0).to(self.device)
-        spend_t = torch.from_numpy(spend).float().unsqueeze(0).to(self.device)
-        ctx_t = torch.from_numpy(context).float().unsqueeze(0).to(self.device)
+        y_t = torch.from_numpy(y.copy()).float().unsqueeze(0).to(self.device)
+        spend_t = torch.from_numpy(spend.copy()).float().unsqueeze(0).to(self.device)
+        ctx_t = torch.from_numpy(context.copy()).float().unsqueeze(0).to(self.device)
         n_ch_t = torch.tensor([n_channels], device=self.device)
-        type_ids_t = torch.from_numpy(channel_type_ids).long().unsqueeze(0).to(self.device)
+        type_ids_t = torch.from_numpy(channel_type_ids.copy()).long().unsqueeze(0).to(self.device)
 
-        # Normalize raw inputs
-        spend_scale = spend_t.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1.0)
-        spend_normed = spend_t / spend_scale
-        y_scale = y_t.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
-        y_normed = y_t / y_scale
-        ctx_scale = ctx_t.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
-        ctx_normed = ctx_t / ctx_scale
         max_ch = spend_t.shape[2]
-        ch_indices = torch.arange(max_ch, device=self.device).unsqueeze(0)
-        channel_mask = ch_indices < n_ch_t.unsqueeze(1)
+        ch_idx = torch.arange(max_ch, device=self.device).unsqueeze(0)
+        channel_mask = ch_idx < n_ch_t.unsqueeze(1)
+        global_stats = _compute_global_stats(y_t, spend_t, n_ch_t)
 
-        pred_shares = self.decoder(
-            spend_normed, y_normed, ctx_normed,
-            type_ids_t[:, :max_ch], channel_mask, n_ch_t,
-        )  # (1, T, DECOMP_COLS)
-        shares = pred_shares.squeeze(0).cpu().numpy()  # (T, DECOMP_COLS)
+        result = self.decoder(
+            spend_t, ctx_t, type_ids_t[:, :max_ch],
+            channel_mask, n_ch_t, global_stats,
+        )
 
-        # Compute absolute contributions
-        contributions = shares * y[:, np.newaxis]  # (T, DECOMP_COLS)
+        contributions = result["contributions"].squeeze(0).cpu().numpy()  # (T, DECOMP_COLS)
+        y_pred = result["y_pred"].squeeze(0).cpu().numpy()  # (T,)
 
-        # Reconstruct y from additive components (skip distribution_cap)
-        additive_mask = np.ones(DECOMP_COLS, dtype=bool)
-        additive_mask[DECOMP_IDX_DISTRIBUTION] = False
-        y_reconstructed = contributions[:, additive_mask].sum(axis=1)
+        # Compute noise as residual
+        contributions[:, DECOMP_IDX_NOISE] = y[:contributions.shape[0]] - y_pred
+
+        # Compute shares for backward compatibility
+        y_safe = np.maximum(np.abs(y[:n_periods]), 1.0)
+        shares = contributions[:n_periods] / y_safe[:, np.newaxis]
 
         return {
-            "shares": shares[:n_periods],
             "contributions": contributions[:n_periods],
-            "y_reconstructed": y_reconstructed[:n_periods],
+            "y_pred": y_pred[:n_periods],
+            "shares": shares,
+            "y_reconstructed": y_pred[:n_periods],
         }
 
     def save(self, path: str) -> None:
-        """Save model weights and config."""
         out = Path(path)
         out.mkdir(parents=True, exist_ok=True)
         torch.save(self.decoder.state_dict(), out / "decoder.pt")
-        torch.save(self.loss_fn.state_dict(), out / "loss_fn.pt")
-
         import json
         config_dict = {k: v for k, v in self.config.__dict__.items()}
         (out / "decomp_config.json").write_text(json.dumps(config_dict, indent=2))
         logger.info("Model saved to %s", path)
 
     def load(self, path: str) -> None:
-        """Load model weights."""
         out = Path(path)
         self.decoder.load_state_dict(
             torch.load(out / "decoder.pt", map_location=self.device, weights_only=True)
         )
-        loss_path = out / "loss_fn.pt"
-        if loss_path.exists():
-            self.loss_fn.load_state_dict(
-                torch.load(loss_path, map_location=self.device, weights_only=True)
-            )
         logger.info("Model loaded from %s", path)
