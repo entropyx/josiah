@@ -29,4 +29,14 @@ Thumbs.db
 neural_output/
 training_data/
 
+# SBI training logs
+sbi-logs/
+
+# Vast.ai instance state
+.vast_instance.json
+
+# Environment / secrets
 .env
+
+# Personal notes
+resultados.md

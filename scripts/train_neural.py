@@ -390,6 +390,88 @@ def evaluate_decomposition(engine, scenario_name: str):
     )
 
 
+def _evaluate_random_scenarios(engine, n_scenarios: int, n_fixed_channels: int | None):
+    """Evaluate on N diverse random scenarios with a summary table."""
+    from demantiq.scenarios.scenario_sampler import ScenarioSampler
+    from demantiq.core.demand_kernel import simulate
+    from demantiq.orchestration.training_format import (
+        extract_context_matrix, ground_truth_to_decomposition,
+        DECOMP_IDX_BASELINE, DECOMP_IDX_CHANNELS_START,
+    )
+    from demantiq.neural.utils import CHANNEL_NAME_TO_IDX, MAX_CHANNELS
+    from scipy.stats import spearmanr
+
+    n_ch = n_fixed_channels or 5
+    sampler = ScenarioSampler(seed=999, rich_context=True, n_fixed_channels=n_ch)
+    configs = sampler.sample(n_scenarios)
+
+    print(f"\n{'='*100}")
+    print(f"  RANDOM SCENARIO EVALUATION — {n_scenarios} scenarios, {n_ch} channels each")
+    print(f"{'='*100}")
+    print(f"\n{'#':<4} {'True Base%':>10} {'Pred Base%':>10} {'True Media%':>11} {'Pred Media%':>11} "
+          f"{'Cat Err':>8} {'Ch Corr':>8} {'Best Ch%':>9} {'Worst Ch%':>10} {'Periods':>8}")
+    print("-" * 105)
+
+    all_cat_errs = []
+    all_ch_corrs = []
+    all_best = []
+    all_worst = []
+
+    for i, sc in enumerate(configs):
+        result = simulate(sc)
+        ch_names = [ch.name for ch in sc.channels]
+        y = result.observable_data["y"].values
+        T = sc.n_periods
+
+        spend = np.column_stack([result.observable_data[f"{ch}_spend"].values for ch in ch_names])
+        if spend.shape[1] < MAX_CHANNELS:
+            spend = np.pad(spend, ((0, 0), (0, MAX_CHANNELS - spend.shape[1])))
+        ctx = extract_context_matrix(result.observable_data, T)
+        type_ids = np.zeros(MAX_CHANNELS, dtype=np.int64)
+        for j, ch in enumerate(ch_names):
+            type_ids[j] = CHANNEL_NAME_TO_IDX.get(ch, 0)
+
+        inf = engine.infer(y, spend, ctx, len(ch_names), type_ids, T)
+        true_decomp = ground_truth_to_decomposition(result.ground_truth, ch_names, T)
+
+        total_y = y[:T].sum()
+        true_base = true_decomp[:, DECOMP_IDX_BASELINE].sum() / total_y * 100
+        pred_base = inf["contributions"][:, DECOMP_IDX_BASELINE].sum() / total_y * 100
+        true_media = sum(true_decomp[:, DECOMP_IDX_CHANNELS_START + j].sum() for j in range(len(ch_names))) / total_y * 100
+        pred_media = sum(inf["contributions"][:, DECOMP_IDX_CHANNELS_START + j].sum() for j in range(len(ch_names))) / total_y * 100
+        cat_err = abs(pred_media - true_media)
+
+        true_totals = [true_decomp[:, DECOMP_IDX_CHANNELS_START + j].sum() for j in range(len(ch_names))]
+        pred_totals = [inf["contributions"][:, DECOMP_IDX_CHANNELS_START + j].sum() for j in range(len(ch_names))]
+        corr, _ = spearmanr(true_totals, pred_totals) if len(ch_names) >= 3 else (0.0, 1.0)
+
+        ch_errs = {}
+        for j, ch in enumerate(ch_names):
+            t, p = true_totals[j], pred_totals[j]
+            ch_errs[ch] = abs(p - t) / max(abs(t), 1.0) * 100
+        best_ch = min(ch_errs.values())
+        worst_ch = max(ch_errs.values())
+
+        all_cat_errs.append(cat_err)
+        all_ch_corrs.append(corr)
+        all_best.append(best_ch)
+        all_worst.append(worst_ch)
+
+        print(f"{i:<4} {true_base:>9.1f}% {pred_base:>9.1f}% {true_media:>10.1f}% {pred_media:>10.1f}% "
+              f"{cat_err:>7.1f}pp {corr:>7.3f} {best_ch:>8.1f}% {worst_ch:>9.1f}% {T:>8}")
+
+    print("-" * 105)
+    print(f"{'AVG':<4} {'':>10} {'':>10} {'':>11} {'':>11} "
+          f"{np.mean(all_cat_errs):>7.1f}pp {np.mean(all_ch_corrs):>7.3f} "
+          f"{np.mean(all_best):>8.1f}% {np.mean(all_worst):>9.1f}%")
+    print(f"\n  Summary:")
+    print(f"    Mean category error:         {np.mean(all_cat_errs):.1f}pp")
+    print(f"    Mean channel rank corr:      {np.mean(all_ch_corrs):.3f}")
+    print(f"    Mean best channel error:     {np.mean(all_best):.1f}%")
+    print(f"    Mean worst channel error:    {np.mean(all_worst):.1f}%")
+    print(f"    % scenarios with corr > 0.5: {np.mean(np.array(all_ch_corrs) > 0.5) * 100:.0f}%")
+
+
 def _plot_decomp_actual_vs_predicted(dates, y_actual, y_pred, r2, rmse, scenario):
     """Plot actual vs predicted y with residuals."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), height_ratios=[3, 1], sharex=True)
@@ -1531,6 +1613,8 @@ def main():
                         help="Use per-period decomposition engine (Phase A — supervised regression)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate for decomposition engine (default: 1e-3)")
+    parser.add_argument("--random-eval", type=int, default=0,
+                        help="Evaluate on N random diverse scenarios (seed=999 for reproducibility)")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1557,9 +1641,15 @@ def main():
             )
 
         # Step 3: Evaluate
-        if args.all_scenarios:
+        if args.random_eval > 0:
+            _evaluate_random_scenarios(engine, args.random_eval, args.fixed_channels)
+        elif args.all_scenarios:
             from demantiq.scenarios.scenario_library import ScenarioLibrary
             for name in ScenarioLibrary.list_scenarios():
+                sc = ScenarioLibrary.get(name)
+                if args.fixed_channels and len(sc.channels) != args.fixed_channels:
+                    logger.info("Skipping %s (%d channels, need %d)", name, len(sc.channels), args.fixed_channels)
+                    continue
                 try:
                     evaluate_decomposition(engine, name)
                 except Exception as e:

@@ -174,6 +174,78 @@ def cmd_destroy(args):
     print("Instance destroyed. Billing stopped.")
 
 
+def cmd_test(args):
+    """Launch cheapest GPU, verify everything works, print result, destroy."""
+    client = get_client()
+    print("Launching test instance...")
+
+    test_script = f"""#!/bin/bash
+set -e
+echo "=== STEP 1: GPU Check ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+python -c "import torch; print(f'CUDA available: {{torch.cuda.is_available()}}'); print(f'Device: {{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}}')"
+
+echo "=== STEP 2: Clone repo ==="
+cd /root
+git clone -b {BRANCH} {REPO_URL} josiah
+cd josiah
+echo "Clone OK: $(git log --oneline -1)"
+
+echo "=== STEP 3: Install ==="
+pip install -e ".[neural]" -q 2>&1 | tail -3
+echo "Install OK"
+
+echo "=== STEP 4: Generate tiny training data (100 samples) ==="
+python -c "
+from demantiq.orchestration.training_pipeline import TrainingPipeline
+from demantiq.scenarios.scenario_sampler import ScenarioSampler
+sampler = ScenarioSampler(seed=42, rich_context=True, n_fixed_channels=5)
+pipeline = TrainingPipeline(sampler, output_dir='test_data', batch_size=100)
+pipeline.generate(n_total=100, n_workers=1, seed=42)
+print('Data generation OK')
+"
+
+echo "=== STEP 5: Train 1 epoch ==="
+python -c "
+from demantiq.neural.decomposition_engine import DecompositionEngine, DecompositionConfig
+config = DecompositionConfig(n_epochs=1, n_train=100, batch_size=32, n_fixed_channels=5, data_dir='test_data')
+engine = DecompositionEngine(config)
+import torch
+print(f'Training on: {{engine.device}}')
+metrics = engine.train(n_train=100)
+print(f'Training OK: {{metrics}}')
+"
+
+echo "=== ALL TESTS PASSED ==="
+echo "Ready for full training run."
+"""
+
+    result = client.launch_instance(
+        gpu_name=args.gpu,
+        num_gpus="1",
+        image="pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime",
+        disk=20.0,
+        onstart_cmd=test_script,
+        ssh=True,
+        label="demantiq-test",
+    )
+    print(result)
+
+    try:
+        if isinstance(result, str):
+            data = json.loads(result)
+            if "new_contract" in data:
+                instance_id = data["new_contract"]
+                save_state(instance_id)
+                print(f"\nInstance ID: {instance_id}")
+                print(f"Test is running (~2-3 min). Check progress with:")
+                print(f"  python scripts/vast_train.py logs")
+                print(f"\nWhen you see 'ALL TESTS PASSED', destroy with:")
+                print(f"  python scripts/vast_train.py destroy")
+    except (json.JSONDecodeError, KeyError):
+        print("\nCheck 'python scripts/vast_train.py status' for your instance.")
+
+
 def cmd_search(args):
     """Browse available GPUs (free — no charges)."""
     client = get_client()
@@ -253,6 +325,11 @@ def main():
     p_search.add_argument("--min-ram", type=int, default=4, help="Minimum GPU RAM in GB (default: 4)")
     p_search.add_argument("--limit", type=int, default=10, help="Number of results")
     p_search.set_defaults(func=cmd_search)
+
+    # Test
+    p_test = sub.add_parser("test", help="Quick verification: launch, clone, install, 1 epoch, destroy (~$0.02)")
+    p_test.add_argument("--gpu", default="RTX_3060", help="GPU type")
+    p_test.set_defaults(func=cmd_test)
 
     args = parser.parse_args()
     if not args.command:

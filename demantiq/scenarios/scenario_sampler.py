@@ -56,7 +56,13 @@ class ScenarioSampler:
         return configs
 
     def _sample_one(self, seed: int) -> SimulationConfig:
-        """Sample a single random SimulationConfig."""
+        """Sample a single random SimulationConfig.
+
+        Uses a regime system to ensure diverse baseline/media splits:
+        ~33% media-dominant (low organic, high betas)
+        ~33% balanced
+        ~33% baseline-dominant (high organic, low betas)
+        """
         rng = self.rng
 
         # Number of channels: fixed or random 2-15
@@ -68,6 +74,21 @@ class ScenarioSampler:
 
         # Number of correlation groups: 1 to n_channels
         n_groups = int(rng.integers(1, max(n_channels, 2)))
+
+        # Regime: controls baseline/media ratio diversity
+        regime = str(rng.choice(["media_dominant", "balanced", "baseline_dominant"]))
+        if regime == "media_dominant":
+            organic_range = (100.0, 800.0)
+            beta_range = (200.0, 800.0)
+            spend_mean_range = (5000.0, 80000.0)
+        elif regime == "baseline_dominant":
+            organic_range = (1500.0, 5000.0)
+            beta_range = (10.0, 150.0)
+            spend_mean_range = (500.0, 15000.0)
+        else:  # balanced
+            organic_range = (500.0, 2000.0)
+            beta_range = (50.0, 500.0)
+            spend_mean_range = (1000.0, 50000.0)
 
         channels = []
         for i, name in enumerate(channel_names):
@@ -85,16 +106,17 @@ class ScenarioSampler:
                               "scale": float(rng.uniform(1.0, 5.0)),
                               "max_lag": int(rng.integers(4, 13))}
 
+            spend_mean = float(rng.uniform(*spend_mean_range))
             channels.append(ChannelConfig(
                 name=name,
-                beta=float(rng.uniform(20.0, 500.0)),
+                beta=float(rng.uniform(*beta_range)),
                 saturation_fn=sat_fn,
                 saturation_params=sat_params,
                 adstock_fn=ads_fn,
                 adstock_params=ads_params,
                 spend_pattern=str(rng.choice(_SPEND_PATTERNS)),
-                spend_mean=float(rng.uniform(1000.0, 50000.0)),
-                spend_std=float(rng.uniform(500.0, 15000.0)),
+                spend_mean=spend_mean,
+                spend_std=float(rng.uniform(spend_mean * 0.1, spend_mean * 0.5)),
                 spend_floor=float(rng.choice([0.0, 0.0, 100.0])),
                 correlation_group=f"group_{i % n_groups}",
             ))
@@ -109,9 +131,9 @@ class ScenarioSampler:
             noise_scale=float(rng.uniform(5.0, 80.0)),
         )
 
-        # Baseline
+        # Baseline — organic_level from regime for diverse baseline/media splits
         baseline = BaselineConfig(
-            organic_level=float(rng.uniform(200.0, 3000.0)),
+            organic_level=float(rng.uniform(*organic_range)),
             trend_type="linear",
             trend_params={"slope": float(rng.uniform(-2.0, 5.0))},
             seasonality_n_terms=int(rng.integers(1, 5)),
