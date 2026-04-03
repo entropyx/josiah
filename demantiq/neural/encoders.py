@@ -243,7 +243,8 @@ class EmbeddingNetwork(nn.Module):
         super().__init__()
         self.temporal_dim = temporal_dim
         self.type_embed_dim = type_embed_dim
-        self.channel_dim = temporal_dim + type_embed_dim  # 80
+        self.channel_dim = temporal_dim + type_embed_dim  # 80 (CNN + type_emb) for Set Transformer
+        self.channel_dim_with_spend = self.channel_dim + 1  # 81 (+ raw spend for temporal path)
         self.global_summary_dim = global_summary_dim
         self.n_context_cols = n_context_cols
 
@@ -294,10 +295,9 @@ class EmbeddingNetwork(nn.Module):
         # When None: fall back to masked mean (loses channel identity).
         self.n_fixed_channels = n_fixed_channels
         if n_fixed_channels is not None:
-            # Concatenate all channels: n_ch * channel_dim + y + ctx + n_ch_scalar
-            temporal_input_dim = n_fixed_channels * self.channel_dim + temporal_dim + temporal_dim + 1
+            temporal_input_dim = n_fixed_channels * self.channel_dim_with_spend + temporal_dim + temporal_dim + 1
         else:
-            temporal_input_dim = self.channel_dim + temporal_dim + temporal_dim + 1
+            temporal_input_dim = self.channel_dim_with_spend + temporal_dim + temporal_dim + 1
         self.temporal_proj = nn.Sequential(
             nn.Linear(temporal_input_dim, global_summary_dim),
             nn.ReLU(),
@@ -389,11 +389,8 @@ class EmbeddingNetwork(nn.Module):
         n_channels: Tensor,
         channel_type_ids: Tensor,
         context: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute per-period features preserving temporal dimension and channel identity.
-
-        Returns per-channel features and global features SEPARATELY so the
-        decoder can process each channel individually (no position ambiguity).
+    ) -> Tensor:
+        """Compute per-period embeddings preserving temporal dimension.
 
         Args:
             y: (batch, T) outcome time series.
@@ -403,9 +400,7 @@ class EmbeddingNetwork(nn.Module):
             context: (batch, T, n_context_cols) business context matrix (optional).
 
         Returns:
-            ch_features: (batch, max_ch, channel_dim, T) per-channel temporal features.
-            global_features: (batch, global_dim, T) global context (y + ctx + n_ch).
-            channel_mask: (batch, max_ch) True for active channels.
+            (batch, T, temporal_embedding_dim) per-period embeddings.
         """
         batch_size = y.shape[0]
         T = y.shape[1]
@@ -446,29 +441,36 @@ class EmbeddingNetwork(nn.Module):
 
         ch_combined = torch.cat([ch_temporal, type_emb_t, spend_raw], dim=2)  # (B, max_ch, channel_dim+1, T_out)
 
-        # 4. Zero out inactive channels
+        # 4. Zero out inactive channels and aggregate
         ch_combined = ch_combined * channel_mask.float().unsqueeze(-1).unsqueeze(-1)
 
-        # 4. Y temporal features (no pooling) — normalize to prevent dying ReLU
-        y_scale = y.abs().amax(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
-        y_normed = y / y_scale
-        y_temporal = self.y_encoder.forward_temporal(y_normed)  # (B, D, T_out)
-
-        # 5. Context temporal features (no pooling) — normalize per column
-        if context is not None:
-            ctx_scale = context.abs().amax(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1, C_ctx)
-            ctx_normed = context / ctx_scale
-            ctx_temporal = self.context_encoder.forward_temporal(ctx_normed)  # (B, D, T_out)
-        else:
-            ctx_temporal = torch.zeros(
-                batch_size, self.temporal_dim, T_out, device=y.device
+        if self.n_fixed_channels is not None:
+            ch_agg = ch_combined[:, :self.n_fixed_channels].reshape(
+                batch_size, self.n_fixed_channels * self.channel_dim_with_spend, T_out
             )
+        else:
+            mask_f = channel_mask.float().unsqueeze(-1).unsqueeze(-1)
+            n_active = mask_f.sum(dim=1).clamp(min=1)
+            ch_agg = (ch_combined * mask_f).sum(dim=1) / n_active
 
-        # 6. Build global context: y + ctx + n_channels
-        n_ch_norm = (n_channels.float() / MAX_CHANNELS).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        n_ch_t = n_ch_norm.expand(-1, -1, T_out)  # (B, 1, T_out)
-        global_features = torch.cat([y_temporal, ctx_temporal, n_ch_t], dim=1)  # (B, 129, T_out)
+        # 5. Y temporal features (no pooling) — normalize to prevent dying ReLU
+        y_scale = y.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
+        y_normed = y / y_scale
+        y_temporal = self.y_encoder.forward_temporal(y_normed)
 
-        # Return per-channel features and global features SEPARATELY
-        # The decoder processes each channel individually — no projection mixing
-        return ch_combined, global_features, channel_mask
+        # 6. Context temporal features (no pooling)
+        if context is not None:
+            ctx_scale = context.abs().amax(dim=1, keepdim=True).clamp(min=1.0)
+            ctx_normed = context / ctx_scale
+            ctx_temporal = self.context_encoder.forward_temporal(ctx_normed)
+        else:
+            ctx_temporal = torch.zeros(batch_size, self.temporal_dim, T_out, device=y.device)
+
+        # 7. Concatenate and project to embedding
+        n_ch_norm = (n_channels.float() / MAX_CHANNELS).unsqueeze(-1).unsqueeze(-1)
+        n_ch_t = n_ch_norm.expand(-1, -1, T_out)
+        combined = torch.cat([ch_agg, y_temporal, ctx_temporal, n_ch_t], dim=1)
+        combined = combined.permute(0, 2, 1)  # (B, T_out, D_total)
+
+        temporal_emb = self.temporal_proj(combined)  # (B, T_out, embedding_dim)
+        return temporal_emb
