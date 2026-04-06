@@ -35,10 +35,12 @@ class ScenarioSampler:
         seed: Master seed for reproducibility.
     """
 
-    def __init__(self, seed: int = 42, rich_context: bool = False, n_fixed_channels: int | None = None):
+    def __init__(self, seed: int = 42, rich_context: bool = False, n_fixed_channels: int | None = None,
+                 channel_range: tuple[int, int] | None = None):
         self.rng = np.random.default_rng(seed)
         self.rich_context = rich_context
         self.n_fixed_channels = n_fixed_channels
+        self.channel_range = channel_range
 
     def sample(self, n: int = 1) -> list[SimulationConfig]:
         """Generate n random SimulationConfigs.
@@ -65,9 +67,11 @@ class ScenarioSampler:
         """
         rng = self.rng
 
-        # Number of channels: fixed or random 2-15
+        # Number of channels: fixed, ranged, or random 2-15
         if self.n_fixed_channels is not None:
             n_channels = self.n_fixed_channels
+        elif self.channel_range is not None:
+            n_channels = int(rng.integers(self.channel_range[0], self.channel_range[1] + 1))
         else:
             n_channels = int(rng.integers(2, 16))
         channel_names = list(rng.choice(_CHANNEL_NAMES, size=n_channels, replace=False))
