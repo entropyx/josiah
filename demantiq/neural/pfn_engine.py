@@ -61,13 +61,13 @@ def pfn_loss(
     max_channels: int,
     masked_loss_weight: float = 5.0,
 ) -> tuple[torch.Tensor, dict]:
-    """PFN loss with held-out (masked) week weighting.
+    """PFN loss on share targets (component / y[t]).
 
-    Masked weeks have their input features zeroed — the model must infer
-    their decomposition from context (visible weeks). Loss is weighted
-    higher on masked weeks to force in-context learning.
+    Targets are shares — the fraction of each week's y attributable to each
+    component. Per-scenario normalization is gone because shares are naturally
+    comparable. Reconstruction: sum of shares should equal 1.0 per week.
 
-    All values are in normalized space (divided by y_scale).
+    Masked weeks get higher loss weight (forcing in-context inference).
     """
     B, T, _ = target.shape
     ch_active = (~channel_pad_mask).float()  # (B, C) 1=active
@@ -83,46 +83,38 @@ def pfn_loss(
     # Time mask: (B, T) 1=valid, 0=padded
     time_valid = (~time_pad_mask).float()
 
-    # Per-week loss weight: masked weeks get higher weight, visible weeks get 1.0
-    # Shape: (B, T)
+    # Per-week weight: masked weeks get higher weight
     week_weight = time_valid * (1.0 + (masked_loss_weight - 1.0) * week_is_masked)
     total_weight = week_weight.sum().clamp(min=1)
 
-    # Per-channel scale (computed from visible-week true values for stability)
-    ch_scale = (true_ch.abs() * time_valid.unsqueeze(-1)).sum(dim=1) / time_valid.sum(dim=1, keepdim=True).clamp(min=1)  # (B, C)
-    ch_scale = ch_scale.clamp(min=0.01)
-
-    # Per-channel MSE, weighted per week
-    ch_diff_sq = ((pred_ch - true_ch) / ch_scale.unsqueeze(1)) ** 2  # (B, T, C)
+    # Per-channel MSE — NO per-scenario normalization (shares already comparable)
+    ch_diff_sq = (pred_ch - true_ch) ** 2  # (B, T, C)
     ch_diff_sq = ch_diff_sq * ch_active.unsqueeze(1) * week_weight.unsqueeze(-1)
     active_week_weight = (ch_active.sum(dim=1).unsqueeze(1) * week_weight).sum().clamp(min=1)
     l_ch = ch_diff_sq.sum() / active_week_weight
 
-    # Baseline MSE, weighted per week
-    base_scale = (true_base.abs() * time_valid).sum(dim=1) / time_valid.sum(dim=1).clamp(min=1)  # (B,)
-    base_scale = base_scale.clamp(min=0.01).unsqueeze(1)
-    l_base = (((pred_base - true_base) / base_scale) ** 2 * week_weight).sum() / total_weight
+    # Baseline MSE (share)
+    l_base = (((pred_base - true_base) ** 2) * week_weight).sum() / total_weight
 
-    # Non-media MSE, weighted per week
-    nm_scale = (true_nm.abs() * time_valid).sum(dim=1) / time_valid.sum(dim=1).clamp(min=1)
-    nm_scale = nm_scale.clamp(min=0.01).unsqueeze(1)
-    l_nm = (((pred_nm - true_nm) / nm_scale) ** 2 * week_weight).sum() / total_weight
+    # Non-media MSE (share)
+    l_nm = (((pred_nm - true_nm) ** 2) * week_weight).sum() / total_weight
 
-    # Reconstruction: sum of components matches true total
-    true_sum = true_base + (true_ch * ch_active.unsqueeze(1)).sum(dim=-1) + true_nm
+    # Reconstruction: shares should sum to ~1 per week
+    # (pred_base + sum(pred_channels) + pred_nm - 1.0) ^ 2
     pred_sum = pred_base + (pred_ch * ch_active.unsqueeze(1)).sum(dim=-1) + pred_nm
-    l_recon = ((pred_sum - true_sum) ** 2 * week_weight).sum() / total_weight
+    target_sum = torch.ones_like(pred_sum)  # shares sum to 1 ideally
+    l_recon = (((pred_sum - target_sum) ** 2) * week_weight).sum() / total_weight
 
     total = l_ch + l_base + l_nm + l_recon
 
-    # Also track loss specifically on masked weeks (the critical metric)
+    # Track masked-week metrics (critical signal for in-context learning)
     masked_weight = time_valid * week_is_masked
     n_masked = masked_weight.sum().clamp(min=1)
     if n_masked > 0:
-        ch_diff_masked = ((pred_ch - true_ch) / ch_scale.unsqueeze(1)) ** 2
+        ch_diff_masked = (pred_ch - true_ch) ** 2
         ch_diff_masked = ch_diff_masked * ch_active.unsqueeze(1) * masked_weight.unsqueeze(-1)
         l_ch_masked = ch_diff_masked.sum() / (ch_active.sum(dim=1).unsqueeze(1) * masked_weight).sum().clamp(min=1)
-        l_base_masked = (((pred_base - true_base) / base_scale) ** 2 * masked_weight).sum() / n_masked
+        l_base_masked = (((pred_base - true_base) ** 2) * masked_weight).sum() / n_masked
     else:
         l_ch_masked = torch.tensor(0.0, device=total.device)
         l_base_masked = torch.tensor(0.0, device=total.device)
@@ -342,6 +334,9 @@ class PFNEngine:
     ) -> dict:
         """Run inference on a single scenario.
 
+        The model outputs per-timestep SHARES (component / y). We multiply by
+        y[t] to recover absolute demand units.
+
         Args:
             y: (T,) observed demand.
             spend: (T, n_channels) per-channel spend.
@@ -354,7 +349,7 @@ class PFNEngine:
         """
         self.model.eval()
 
-        x, y_scale = build_pfn_input(
+        x, _ = build_pfn_input(
             spend, y, context,
             max_channels=self.config.max_channels,
             n_context_dims=self.config.n_context_dims,
@@ -364,9 +359,15 @@ class PFNEngine:
         pred = self.model(x)
 
         C = self.config.max_channels
-        pred_ch = pred["channel_contributions"][0].cpu().numpy() * y_scale  # (T, C)
-        pred_base = pred["baseline"][0].cpu().numpy() * y_scale              # (T,)
-        pred_nm = pred["non_media"][0].cpu().numpy() * y_scale               # (T,)
+        # Model outputs shares; multiply by y[t] to get absolute values
+        pred_ch_shares = pred["channel_contributions"][0].cpu().numpy()  # (T, C)
+        pred_base_share = pred["baseline"][0].cpu().numpy()              # (T,)
+        pred_nm_share = pred["non_media"][0].cpu().numpy()               # (T,)
+
+        y_t = y.astype(np.float32)  # (T,)
+        pred_ch = pred_ch_shares * y_t[:, np.newaxis]
+        pred_base = pred_base_share * y_t
+        pred_nm = pred_nm_share * y_t
 
         ch_contribs = pred_ch[:, :n_channels]
         y_hat = pred_base + ch_contribs.sum(axis=1) + pred_nm

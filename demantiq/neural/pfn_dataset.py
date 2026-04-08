@@ -159,29 +159,43 @@ class PFNScenarioDataset(Dataset):
             dim=1,
         )  # (T, max_channels + 1 + 2*n_context_dims + 4)
 
-        # --- target: (T, max_channels + 2), normalized by y_scale ---
+        # --- target: per-timestep SHARES (component / y[t]) ---
+        # Shares carry per-timestep signal and naturally sum to ~1, giving
+        # the model a hard reconstruction constraint that varies across
+        # scenarios. Clamp y in denominator to avoid instability when y → 0.
+        y_raw_t = torch.from_numpy(y_raw.copy())  # (T,) original scale
+        y_denom = y_raw_t.abs().clamp(min=max(y_scale * 0.1, 1.0))  # (T,)
+
         ch_start = DECOMP_IDX_CHANNELS_START
         ch_raw = self._decomposition[
             scenario_idx, :n_periods, ch_start : ch_start + n_ch
         ]  # (T, n_ch)
         channel_contribs = torch.zeros(n_periods, self.max_channels, dtype=torch.float32)
-        channel_contribs[:, :n_ch] = torch.from_numpy(ch_raw.copy()) / y_scale
+        channel_contribs[:, :n_ch] = (
+            torch.from_numpy(ch_raw.copy()) / y_denom.unsqueeze(1)
+        )
 
-        baseline = torch.from_numpy(
-            self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_BASELINE].copy()
-        ) / y_scale  # (T,)
+        baseline = (
+            torch.from_numpy(
+                self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_BASELINE].copy()
+            )
+            / y_denom
+        )  # (T,) — baseline share per timestep
 
         non_media = (
-            torch.from_numpy(
-                self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_PRICE].copy()
+            (
+                torch.from_numpy(
+                    self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_PRICE].copy()
+                )
+                + torch.from_numpy(
+                    self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_COMPETITION].copy()
+                )
+                + torch.from_numpy(
+                    self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_MACRO].copy()
+                )
             )
-            + torch.from_numpy(
-                self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_COMPETITION].copy()
-            )
-            + torch.from_numpy(
-                self._decomposition[scenario_idx, :n_periods, DECOMP_IDX_MACRO].copy()
-            )
-        ) / y_scale  # (T,)
+            / y_denom
+        )  # (T,) — non-media share per timestep
 
         target = torch.cat(
             [
