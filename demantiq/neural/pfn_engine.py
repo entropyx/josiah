@@ -44,6 +44,8 @@ class PFNConfig:
     grad_clip: float = 1.0
     val_fraction: float = 0.1
     context_dropout: float = 0.3
+    week_mask_fraction: float = 0.3  # fraction of weeks masked per scenario during training
+    masked_loss_weight: float = 5.0  # loss weight for masked weeks (vs 1.0 for visible)
 
     # Data
     n_train: int = 100000
@@ -55,9 +57,15 @@ def pfn_loss(
     target: torch.Tensor,
     time_pad_mask: torch.Tensor,
     channel_pad_mask: torch.Tensor,
+    week_is_masked: torch.Tensor,
     max_channels: int,
+    masked_loss_weight: float = 5.0,
 ) -> tuple[torch.Tensor, dict]:
-    """Compute loss for PFN decomposition predictions.
+    """PFN loss with held-out (masked) week weighting.
+
+    Masked weeks have their input features zeroed — the model must infer
+    their decomposition from context (visible weeks). Loss is weighted
+    higher on masked weeks to force in-context learning.
 
     All values are in normalized space (divided by y_scale).
     """
@@ -74,41 +82,58 @@ def pfn_loss(
 
     # Time mask: (B, T) 1=valid, 0=padded
     time_valid = (~time_pad_mask).float()
-    n_valid = time_valid.sum().clamp(min=1)
 
-    # Per-channel MSE (normalized by channel scale, masked for active + valid timesteps)
+    # Per-week loss weight: masked weeks get higher weight, visible weeks get 1.0
+    # Shape: (B, T)
+    week_weight = time_valid * (1.0 + (masked_loss_weight - 1.0) * week_is_masked)
+    total_weight = week_weight.sum().clamp(min=1)
+
+    # Per-channel scale (computed from visible-week true values for stability)
     ch_scale = (true_ch.abs() * time_valid.unsqueeze(-1)).sum(dim=1) / time_valid.sum(dim=1, keepdim=True).clamp(min=1)  # (B, C)
     ch_scale = ch_scale.clamp(min=0.01)
-    ch_diff = (pred_ch - true_ch) / ch_scale.unsqueeze(1)
-    ch_diff = ch_diff * ch_active.unsqueeze(1) * time_valid.unsqueeze(-1)
-    n_active_total = (ch_active.sum(dim=1) * time_valid.sum(dim=1)).sum().clamp(min=1)
-    l_ch = (ch_diff ** 2).sum() / n_active_total
 
-    # Baseline MSE
+    # Per-channel MSE, weighted per week
+    ch_diff_sq = ((pred_ch - true_ch) / ch_scale.unsqueeze(1)) ** 2  # (B, T, C)
+    ch_diff_sq = ch_diff_sq * ch_active.unsqueeze(1) * week_weight.unsqueeze(-1)
+    active_week_weight = (ch_active.sum(dim=1).unsqueeze(1) * week_weight).sum().clamp(min=1)
+    l_ch = ch_diff_sq.sum() / active_week_weight
+
+    # Baseline MSE, weighted per week
     base_scale = (true_base.abs() * time_valid).sum(dim=1) / time_valid.sum(dim=1).clamp(min=1)  # (B,)
     base_scale = base_scale.clamp(min=0.01).unsqueeze(1)
-    l_base = (((pred_base - true_base) / base_scale) ** 2 * time_valid).sum() / n_valid
+    l_base = (((pred_base - true_base) / base_scale) ** 2 * week_weight).sum() / total_weight
 
-    # Non-media MSE
+    # Non-media MSE, weighted per week
     nm_scale = (true_nm.abs() * time_valid).sum(dim=1) / time_valid.sum(dim=1).clamp(min=1)
     nm_scale = nm_scale.clamp(min=0.01).unsqueeze(1)
-    l_nm = (((pred_nm - true_nm) / nm_scale) ** 2 * time_valid).sum() / n_valid
+    l_nm = (((pred_nm - true_nm) / nm_scale) ** 2 * week_weight).sum() / total_weight
 
-    # Reconstruction: channel + baseline + non_media should sum to y_normed
-    # y_normed is at position max_channels in input features, but we don't have it here.
-    # Instead, sum of true target components ≈ y_normed (by construction).
-    # Use reconstruction against true total:
+    # Reconstruction: sum of components matches true total
     true_sum = true_base + (true_ch * ch_active.unsqueeze(1)).sum(dim=-1) + true_nm
     pred_sum = pred_base + (pred_ch * ch_active.unsqueeze(1)).sum(dim=-1) + pred_nm
-    l_recon = ((pred_sum - true_sum) ** 2 * time_valid).sum() / n_valid
+    l_recon = ((pred_sum - true_sum) ** 2 * week_weight).sum() / total_weight
 
     total = l_ch + l_base + l_nm + l_recon
+
+    # Also track loss specifically on masked weeks (the critical metric)
+    masked_weight = time_valid * week_is_masked
+    n_masked = masked_weight.sum().clamp(min=1)
+    if n_masked > 0:
+        ch_diff_masked = ((pred_ch - true_ch) / ch_scale.unsqueeze(1)) ** 2
+        ch_diff_masked = ch_diff_masked * ch_active.unsqueeze(1) * masked_weight.unsqueeze(-1)
+        l_ch_masked = ch_diff_masked.sum() / (ch_active.sum(dim=1).unsqueeze(1) * masked_weight).sum().clamp(min=1)
+        l_base_masked = (((pred_base - true_base) / base_scale) ** 2 * masked_weight).sum() / n_masked
+    else:
+        l_ch_masked = torch.tensor(0.0, device=total.device)
+        l_base_masked = torch.tensor(0.0, device=total.device)
 
     return total, {
         "channels": l_ch.item(),
         "baseline": l_base.item(),
         "non_media": l_nm.item(),
         "reconstruction": l_recon.item(),
+        "ch_masked": l_ch_masked.item(),
+        "bl_masked": l_base_masked.item(),
         "total": total.item(),
     }
 
@@ -158,6 +183,7 @@ class PFNEngine:
             backing, train_indices,
             max_channels=self.config.max_channels,
             context_dropout=self.config.context_dropout,
+            week_mask_fraction=self.config.week_mask_fraction,
             training=True,
         )
 
@@ -166,6 +192,7 @@ class PFNEngine:
             backing, val_indices,
             max_channels=self.config.max_channels,
             context_dropout=0.0,
+            week_mask_fraction=0.0,  # val measures inference-time performance (no masking)
             training=False,
         ) if has_val else None
 
@@ -218,13 +245,14 @@ class PFNEngine:
             elapsed = time.time() - t_start
             lr = self.optimizer.param_groups[0]["lr"]
 
-            if epoch % 10 == 0 or epoch == self.config.n_epochs - 1:
+            if epoch % 5 == 0 or epoch == self.config.n_epochs - 1:
                 logger.info(
-                    "Epoch %3d/%d  train=%.4f (ch=%.4f bl=%.4f nm=%.4f rc=%.4f)  "
-                    "val=%.4f  lr=%.1e  [%.0fs]",
+                    "Epoch %3d/%d  train=%.4f (ch=%.4f bl=%.4f nm=%.4f rc=%.4f "
+                    "ch_m=%.4f bl_m=%.4f)  val=%.4f  lr=%.1e  [%.0fs]",
                     epoch + 1, self.config.n_epochs,
                     train_loss, train_comp["channels"], train_comp["baseline"],
                     train_comp["non_media"], train_comp["reconstruction"],
+                    train_comp.get("ch_masked", 0), train_comp.get("bl_masked", 0),
                     val_loss, lr, elapsed,
                 )
 
@@ -295,9 +323,14 @@ class PFNEngine:
         target = batch["target"].to(self.device)
         time_mask = batch["time_pad_mask"].to(self.device)
         ch_mask = batch["channel_pad_mask"].to(self.device)
+        week_is_masked = batch["week_is_masked"].to(self.device)
 
         pred = self.model(x, src_key_padding_mask=time_mask)
-        return pfn_loss(pred, target, time_mask, ch_mask, self.config.max_channels)
+        return pfn_loss(
+            pred, target, time_mask, ch_mask, week_is_masked,
+            max_channels=self.config.max_channels,
+            masked_loss_weight=self.config.masked_loss_weight,
+        )
 
     @torch.no_grad()
     def infer(
@@ -369,11 +402,13 @@ class _SubsetPFNDataset(PFNScenarioDataset):
         max_channels: int = 8,
         n_context_dims: int = 10,
         context_dropout: float = 0.3,
+        week_mask_fraction: float = 0.3,
         training: bool = True,
     ):
         self.max_channels = max_channels
         self.n_context_dims = n_context_dims
         self.context_dropout = context_dropout
+        self.week_mask_fraction = week_mask_fraction
         self.training = training
 
         self._y = backing.y

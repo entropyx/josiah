@@ -39,8 +39,8 @@ class PFNDecompositionModel(nn.Module):
         self.n_context_dims = n_context_dims
         n_outputs = max_channels + 2  # channels + baseline + non_media
 
-        # Input: spend (C) + y (1) + context (D) + flags (D) + time_idx (1) + sin (1) + cos (1)
-        n_input_features = max_channels + 1 + 2 * n_context_dims + 3
+        # Input: spend (C) + y (1) + context (D) + flags (D) + time_idx (1) + sin (1) + cos (1) + is_masked (1)
+        n_input_features = max_channels + 1 + 2 * n_context_dims + 4
 
         self.input_proj = nn.Linear(n_input_features, d_model)
 
@@ -152,11 +152,14 @@ def build_pfn_input(
     sin_week = np.sin(2.0 * np.pi * week_of_year / 52.0).reshape(T, 1)
     cos_week = np.cos(2.0 * np.pi * week_of_year / 52.0).reshape(T, 1)
 
+    # is_masked: all zeros at inference (no weeks are masked)
+    is_masked = np.zeros((T, 1), dtype=np.float32)
+
     # --- concatenate ---
     features = np.concatenate(
-        [spend_normed, y_normed, ctx_normed, flags_tiled, time_index, sin_week, cos_week],
+        [spend_normed, y_normed, ctx_normed, flags_tiled, time_index, sin_week, cos_week, is_masked],
         axis=1,
-    )  # (T, max_channels + 1 + 2*n_context_dims + 3)
+    )  # (T, max_channels + 1 + 2*n_context_dims + 4)
 
     input_tensor = torch.from_numpy(features).unsqueeze(0)  # (1, T, n_features)
     return input_tensor, y_scale

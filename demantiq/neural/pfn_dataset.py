@@ -44,11 +44,13 @@ class PFNScenarioDataset(Dataset):
         max_channels: int = 8,
         n_context_dims: int = MAX_CONTEXT_COLS,
         context_dropout: float = 0.3,
+        week_mask_fraction: float = 0.3,
         training: bool = True,
     ) -> None:
         self.max_channels = max_channels
         self.n_context_dims = n_context_dims
         self.context_dropout = context_dropout
+        self.week_mask_fraction = week_mask_fraction
         self.training = training
 
         # Hold references only — no data copying
@@ -120,10 +122,29 @@ class PFNScenarioDataset(Dataset):
         col_scales = ctx_raw.abs().amax(dim=0).clamp(min=1.0)
         ctx_normed = ctx_raw / col_scales
 
+        # --- BERT-style week masking (PFN held-out prediction) ---
+        # During training: randomly mask a fraction of weeks. Masked weeks
+        # have their content features zeroed, forcing the model to infer
+        # decomposition for these weeks from context (unmasked weeks).
+        # At inference: no masking — the model applies its learned in-context
+        # inference skill to all weeks.
+        week_is_masked = torch.zeros(n_periods, dtype=torch.float32)
+        if self.training and self.week_mask_fraction > 0.0:
+            n_mask = max(1, int(n_periods * self.week_mask_fraction))
+            mask_indices = torch.randperm(n_periods)[:n_mask]
+            week_is_masked[mask_indices] = 1.0
+
+            # Zero out content features for masked weeks
+            # (channel spend, y, context, presence flags)
+            visible = 1.0 - week_is_masked  # (T,)
+            spend_norm = spend_norm * visible.unsqueeze(1)
+            y_norm = y_norm * visible
+            ctx_normed = ctx_normed * visible.unsqueeze(1)
+
         # --- assemble input_features: (T, n_features) ---
-        # Layout must match build_pfn_input and PFNDecompositionModel:
+        # Layout must match PFNDecompositionModel:
         # spend(max_channels) + y(1) + context(n_context_dims) +
-        # presence_flags(n_context_dims) + time_index(1) + sin_week(1) + cos_week(1)
+        # presence_flags(n_context_dims) + time_index(1) + sin_week(1) + cos_week(1) + is_masked(1)
         input_features = torch.cat(
             [
                 spend_norm,                                     # (T, max_channels)
@@ -133,9 +154,10 @@ class PFNScenarioDataset(Dataset):
                 time_index.unsqueeze(1),                        # (T, 1)
                 sin_week.unsqueeze(1),                          # (T, 1)
                 cos_week.unsqueeze(1),                          # (T, 1)
+                week_is_masked.unsqueeze(1),                    # (T, 1)
             ],
             dim=1,
-        )  # (T, max_channels + 1 + 2*n_context_dims + 3)
+        )  # (T, max_channels + 1 + 2*n_context_dims + 4)
 
         # --- target: (T, max_channels + 2), normalized by y_scale ---
         ch_start = DECOMP_IDX_CHANNELS_START
@@ -177,6 +199,7 @@ class PFNScenarioDataset(Dataset):
         return {
             "input_features": input_features.float(),
             "target": target.float(),
+            "week_is_masked": week_is_masked.float(),  # (T,) 1=masked, 0=visible
             "y_scale": torch.tensor(y_scale, dtype=torch.float32),
             "n_channels": torch.tensor(n_ch, dtype=torch.int32),
             "n_periods": torch.tensor(n_periods, dtype=torch.int32),
@@ -196,6 +219,7 @@ def pfn_collate_fn(batch: list[dict]) -> dict:
     input_features = torch.zeros(b, max_t, n_features, dtype=torch.float32)
     target = torch.zeros(b, max_t, n_outputs, dtype=torch.float32)
     time_pad_mask = torch.ones(b, max_t, dtype=torch.bool)  # True = padded
+    week_is_masked = torch.zeros(b, max_t, dtype=torch.float32)  # 1 = masked week
 
     y_scales = torch.zeros(b, dtype=torch.float32)
     n_channels = torch.zeros(b, dtype=torch.int32)
@@ -207,6 +231,7 @@ def pfn_collate_fn(batch: list[dict]) -> dict:
         input_features[i, :t] = item["input_features"]
         target[i, :t] = item["target"]
         time_pad_mask[i, :t] = False  # valid timesteps
+        week_is_masked[i, :t] = item["week_is_masked"]
         y_scales[i] = item["y_scale"]
         n_channels[i] = item["n_channels"]
         n_periods[i] = item["n_periods"]
@@ -216,6 +241,7 @@ def pfn_collate_fn(batch: list[dict]) -> dict:
         "input_features": input_features,
         "target": target,
         "time_pad_mask": time_pad_mask,
+        "week_is_masked": week_is_masked,
         "y_scale": y_scales,
         "n_channels": n_channels,
         "n_periods": n_periods,
