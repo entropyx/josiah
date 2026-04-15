@@ -89,10 +89,13 @@ def main():
         print(f"  Per-channel err:      {metrics['per_channel_error_pct']:.1f}%  (target: <20%)")
         print(f"  True base %: {metrics['true_baseline_pct']:.1f}  Pred: {metrics['pred_baseline_pct']:.1f}")
 
+        # Baseline R² blows up when baseline is near-constant (low variance
+        # denominator). Gate on category error instead, which is robust.
         passed = (
             metrics['rank_corr'] > 0.9
             and metrics['channel_r2_mean'] > 0.8
-            and metrics['baseline_r2'] > 0.8
+            and metrics['category_error_pp'] < 5.0
+            and metrics['per_channel_error_pct'] < 20.0
         )
         print(f"\n  {'PASSED' if passed else 'FAILED'}")
 
