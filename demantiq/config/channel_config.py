@@ -31,6 +31,9 @@ class ChannelConfig:
     spend_std: float = 3000.0
     spend_floor: float = 0.0
     correlation_group: str = "default"
+    # Media efficiency parameters (used for synthetic impressions/clicks generation)
+    cpm: float = 10.0  # Cost per 1000 impressions in dollars
+    ctr: float = 0.01  # Click-through rate (fraction of impressions that become clicks)
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +48,8 @@ class ChannelConfig:
             "spend_std": self.spend_std,
             "spend_floor": self.spend_floor,
             "correlation_group": self.correlation_group,
+            "cpm": self.cpm,
+            "ctr": self.ctr,
         }
 
     @classmethod
