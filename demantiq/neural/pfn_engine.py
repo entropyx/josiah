@@ -331,26 +331,25 @@ class PFNEngine:
         spend: np.ndarray,
         context: np.ndarray,
         n_channels: int,
+        impressions: np.ndarray | None = None,
+        clicks: np.ndarray | None = None,
     ) -> dict:
         """Run inference on a single scenario.
-
-        The model outputs per-timestep SHARES (component / y). We multiply by
-        y[t] to recover absolute demand units.
 
         Args:
             y: (T,) observed demand.
             spend: (T, n_channels) per-channel spend.
             context: (T, n_context_dims) context variables.
             n_channels: number of active channels.
-
-        Returns:
-            Dict with channel_contributions (T, n_ch), baseline (T,),
-            non_media (T,), y_hat (T,) — all in absolute demand units.
+            impressions: (T, n_channels) per-channel impressions (optional).
+            clicks: (T, n_channels) per-channel clicks (optional).
         """
         self.model.eval()
 
         x, _ = build_pfn_input(
             spend, y, context,
+            impressions=impressions,
+            clicks=clicks,
             max_channels=self.config.max_channels,
             n_context_dims=self.config.n_context_dims,
         )
@@ -414,6 +413,8 @@ class _SubsetPFNDataset(PFNScenarioDataset):
 
         self._y = backing.y
         self._spend = backing.spend
+        self._impressions = backing.impressions
+        self._clicks = backing.clicks
         self._context = backing.context
         self._decomposition = backing.decomposition
         self._n_periods = backing.n_periods

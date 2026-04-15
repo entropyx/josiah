@@ -39,8 +39,9 @@ class PFNDecompositionModel(nn.Module):
         self.n_context_dims = n_context_dims
         n_outputs = max_channels + 2  # channels + baseline + non_media
 
-        # Input: spend (C) + y (1) + context (D) + flags (D) + time_idx (1) + sin (1) + cos (1) + is_masked (1)
-        n_input_features = max_channels + 1 + 2 * n_context_dims + 4
+        # Input: spend (C) + impressions (C) + clicks (C) + y (1) + context (D)
+        #        + flags (D) + time_idx (1) + sin (1) + cos (1) + is_masked (1)
+        n_input_features = 3 * max_channels + 1 + 2 * n_context_dims + 4
 
         self.input_proj = nn.Linear(n_input_features, d_model)
 
@@ -104,18 +105,24 @@ def build_pfn_input(
     spend: np.ndarray,
     y: np.ndarray,
     context: np.ndarray,
+    impressions: np.ndarray | None = None,
+    clicks: np.ndarray | None = None,
     max_channels: int = 8,
     n_context_dims: int = 10,
 ) -> tuple[torch.Tensor, float]:
     """Prepare input features for PFNDecompositionModel.
 
-    Normalizes inputs and builds the feature tensor.
+    Includes per-channel spend, impressions, and clicks. Each channel is
+    normalized by its own max (per-channel normalization) to preserve
+    small-channel variation.
 
     Args:
         spend: (T, n_channels) raw spend.
         y: (T,) observed demand.
         context: (T, n_context_dims) context variables.
-        max_channels: Maximum channel slots; spend is zero-padded to this size.
+        impressions: (T, n_channels) raw impressions. If None, treated as zeros.
+        clicks: (T, n_channels) raw clicks. If None, treated as zeros.
+        max_channels: Maximum channel slots; zero-padded to this size.
         n_context_dims: Expected context dimension; context is zero-padded if needed.
 
     Returns:
@@ -123,27 +130,36 @@ def build_pfn_input(
         and y_scale is the normalization factor to recover absolute values.
     """
     T = len(y)
+    n_channels = spend.shape[1] if spend.ndim == 2 else 1
 
     # --- y ---
     y_scale = float(max(float(np.abs(y).mean()), 1.0))
     y_normed = (y / y_scale).astype(np.float32).reshape(T, 1)
 
-    # --- spend ---
-    n_channels = spend.shape[1] if spend.ndim == 2 else 1
-    spend_padded = np.zeros((T, max_channels), dtype=np.float32)
-    spend_padded[:, :min(n_channels, max_channels)] = spend[:, :min(n_channels, max_channels)]
-    spend_scale = float(max(float(np.abs(spend_padded).max()), 1.0))
-    spend_normed = (spend_padded / spend_scale).astype(np.float32)
+    # --- global normalize helper (max across all channels, preserves relative scale) ---
+    def _pad_and_normalize(arr: np.ndarray | None) -> np.ndarray:
+        out = np.zeros((T, max_channels), dtype=np.float32)
+        if arr is None:
+            return out
+        nc = min(arr.shape[1] if arr.ndim == 2 else 1, max_channels)
+        sliced = arr[:, :nc].astype(np.float32)
+        scale = float(max(np.abs(sliced).max(), 1.0))
+        out[:, :nc] = sliced / scale
+        return out
+
+    spend_normed = _pad_and_normalize(spend)
+    imp_normed = _pad_and_normalize(impressions)
+    clk_normed = _pad_and_normalize(clicks)
 
     # --- context ---
     ctx_cols = context.shape[1] if context.ndim == 2 else 1
     ctx_padded = np.zeros((T, n_context_dims), dtype=np.float32)
     ctx_padded[:, :min(ctx_cols, n_context_dims)] = context[:, :min(ctx_cols, n_context_dims)]
 
-    flags = (np.abs(ctx_padded).sum(axis=0) > 0).astype(np.float32)  # (n_context_dims,)
-    flags_tiled = np.tile(flags, (T, 1))  # (T, n_context_dims)
+    flags = (np.abs(ctx_padded).sum(axis=0) > 0).astype(np.float32)
+    flags_tiled = np.tile(flags, (T, 1))
 
-    col_scales = np.maximum(np.abs(ctx_padded).max(axis=0), 1.0)  # (n_context_dims,)
+    col_scales = np.maximum(np.abs(ctx_padded).max(axis=0), 1.0)
     ctx_normed = (ctx_padded / col_scales).astype(np.float32)
 
     # --- temporal features ---
@@ -152,14 +168,24 @@ def build_pfn_input(
     sin_week = np.sin(2.0 * np.pi * week_of_year / 52.0).reshape(T, 1)
     cos_week = np.cos(2.0 * np.pi * week_of_year / 52.0).reshape(T, 1)
 
-    # is_masked: all zeros at inference (no weeks are masked)
     is_masked = np.zeros((T, 1), dtype=np.float32)
 
-    # --- concatenate ---
+    # --- concatenate: must match dataset layout ---
     features = np.concatenate(
-        [spend_normed, y_normed, ctx_normed, flags_tiled, time_index, sin_week, cos_week, is_masked],
+        [
+            spend_normed,   # (T, C)
+            imp_normed,     # (T, C)
+            clk_normed,     # (T, C)
+            y_normed,       # (T, 1)
+            ctx_normed,     # (T, D)
+            flags_tiled,    # (T, D)
+            time_index,     # (T, 1)
+            sin_week,       # (T, 1)
+            cos_week,       # (T, 1)
+            is_masked,      # (T, 1)
+        ],
         axis=1,
-    )  # (T, max_channels + 1 + 2*n_context_dims + 4)
+    )  # (T, 3*C + 1 + 2*D + 4)
 
-    input_tensor = torch.from_numpy(features).unsqueeze(0)  # (1, T, n_features)
+    input_tensor = torch.from_numpy(features).unsqueeze(0)
     return input_tensor, y_scale

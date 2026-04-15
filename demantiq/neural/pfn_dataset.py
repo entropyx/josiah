@@ -56,6 +56,8 @@ class PFNScenarioDataset(Dataset):
         # Hold references only — no data copying
         self._y = backing_dataset.y
         self._spend = backing_dataset.spend
+        self._impressions = backing_dataset.impressions
+        self._clicks = backing_dataset.clicks
         self._context = backing_dataset.context
         self._decomposition = backing_dataset.decomposition
         self._n_periods = backing_dataset.n_periods
@@ -84,11 +86,23 @@ class PFNScenarioDataset(Dataset):
         y_scale = float(max(np.mean(np.abs(y_raw)), 1.0))
         y_norm = torch.from_numpy(y_raw.copy() / y_scale)  # (T,)
 
-        # --- spend: (T, max_channels), normalized globally ---
+        # --- spend/impressions/clicks: global normalization (max across all channels) ---
+        # This preserves RELATIVE magnitudes between channels (small-spend channels
+        # stay small). The model uses the relative magnitude as a signal.
         spend_raw = self._spend[scenario_idx, :n_periods, :n_ch]  # (T, n_ch)
+        imp_raw = self._impressions[scenario_idx, :n_periods, :n_ch]
+        clk_raw = self._clicks[scenario_idx, :n_periods, :n_ch]
+
         spend_scale = float(max(np.abs(spend_raw).max(), 1.0))
+        imp_scale = float(max(np.abs(imp_raw).max(), 1.0))
+        clk_scale = float(max(np.abs(clk_raw).max(), 1.0))
+
         spend_norm = torch.zeros(n_periods, self.max_channels, dtype=torch.float32)
         spend_norm[:, :n_ch] = torch.from_numpy(spend_raw.copy() / spend_scale)
+        imp_norm = torch.zeros(n_periods, self.max_channels, dtype=torch.float32)
+        imp_norm[:, :n_ch] = torch.from_numpy(imp_raw.copy() / imp_scale)
+        clk_norm = torch.zeros(n_periods, self.max_channels, dtype=torch.float32)
+        clk_norm[:, :n_ch] = torch.from_numpy(clk_raw.copy() / clk_scale)
 
         # --- context + presence flags + dropout ---
         ctx_raw = torch.from_numpy(
@@ -135,19 +149,24 @@ class PFNScenarioDataset(Dataset):
             week_is_masked[mask_indices] = 1.0
 
             # Zero out content features for masked weeks
-            # (channel spend, y, context, presence flags)
+            # (channel spend/impressions/clicks, y, context, presence flags)
             visible = 1.0 - week_is_masked  # (T,)
             spend_norm = spend_norm * visible.unsqueeze(1)
+            imp_norm = imp_norm * visible.unsqueeze(1)
+            clk_norm = clk_norm * visible.unsqueeze(1)
             y_norm = y_norm * visible
             ctx_normed = ctx_normed * visible.unsqueeze(1)
 
         # --- assemble input_features: (T, n_features) ---
         # Layout must match PFNDecompositionModel:
-        # spend(max_channels) + y(1) + context(n_context_dims) +
-        # presence_flags(n_context_dims) + time_index(1) + sin_week(1) + cos_week(1) + is_masked(1)
+        # spend(C) + impressions(C) + clicks(C) + y(1) + context(D) +
+        # presence_flags(D) + time_index(1) + sin_week(1) + cos_week(1) + is_masked(1)
+        # n_features = 3*max_channels + 1 + 2*n_context_dims + 4
         input_features = torch.cat(
             [
                 spend_norm,                                     # (T, max_channels)
+                imp_norm,                                       # (T, max_channels)
+                clk_norm,                                       # (T, max_channels)
                 y_norm.unsqueeze(1),                            # (T, 1)
                 ctx_normed,                                     # (T, n_context_dims)
                 presence_flags,                                 # (T, n_context_dims)
@@ -157,7 +176,7 @@ class PFNScenarioDataset(Dataset):
                 week_is_masked.unsqueeze(1),                    # (T, 1)
             ],
             dim=1,
-        )  # (T, max_channels + 1 + 2*n_context_dims + 4)
+        )  # (T, 3*max_channels + 1 + 2*n_context_dims + 4)
 
         # --- target: per-timestep SHARES (component / y[t]) ---
         # Shares carry per-timestep signal and naturally sum to ~1, giving

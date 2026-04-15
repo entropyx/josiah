@@ -150,11 +150,12 @@ class ProperPFNEngine:
             if epoch % 5 == 0 or epoch == self.config.n_epochs - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "Epoch %3d/%d  train=%.4f (ch=%.4f bl=%.4f nm=%.4f rc=%.4f) "
-                    "val=%.4f  lr=%.1e  [%.0fs]",
+                    "Epoch %3d/%d  train=%.4f (ch=%.4f bl=%.4f nm=%.4f rc=%.4f "
+                    "ch_m=%.4f bl_m=%.4f) val=%.4f  lr=%.1e  [%.0fs]",
                     epoch + 1, self.config.n_epochs, train_loss,
-                    train_comp["channels_masked"], train_comp["baseline_masked"],
-                    train_comp["non_media_masked"], train_comp["reconstruction_masked"],
+                    train_comp.get("channels", 0.0), train_comp.get("baseline", 0.0),
+                    train_comp.get("non_media", 0.0), train_comp.get("reconstruction", 0.0),
+                    train_comp.get("channels_masked", 0.0), train_comp.get("baseline_masked", 0.0),
                     val_loss, lr, time.time() - t0,
                 )
 
