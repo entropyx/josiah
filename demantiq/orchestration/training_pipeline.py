@@ -54,7 +54,9 @@ class TrainingPipeline:
         from demantiq.orchestration.parallel_runner import run_parallel
         from demantiq.orchestration.training_format import (
             config_to_vector,
+            extract_clicks_matrix,
             extract_context_matrix,
+            extract_impressions_matrix,
             ground_truth_to_decomposition,
             save_batch,
             summary_to_vector,
@@ -107,11 +109,20 @@ class TrainingPipeline:
                 else:
                     spend_matrix = np.zeros((config.n_periods, 0))
 
+                impressions_matrix = extract_impressions_matrix(
+                    result.observable_data, config.n_periods, channel_names
+                )
+                clicks_matrix = extract_clicks_matrix(
+                    result.observable_data, config.n_periods, channel_names
+                )
+
                 tuples.append(
                     {
                         "config_vector": config_to_vector(config),
                         "y": result.observable_data["y"].values,
                         "spend_matrix": spend_matrix,
+                        "impressions_matrix": impressions_matrix,
+                        "clicks_matrix": clicks_matrix,
                         "context_matrix": extract_context_matrix(
                             result.observable_data, config.n_periods
                         ),

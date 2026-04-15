@@ -369,6 +369,28 @@ def extract_context_matrix(observable_data, n_periods: int) -> np.ndarray:
     return ctx
 
 
+def extract_impressions_matrix(observable_data, n_periods: int, channel_names: list[str]) -> np.ndarray:
+    """Extract per-channel impressions into a matrix (n_periods, n_channels)."""
+    n_ch = len(channel_names)
+    matrix = np.zeros((n_periods, n_ch), dtype=np.float32)
+    for i, name in enumerate(channel_names):
+        col = f"{name}_impressions"
+        if col in observable_data.columns:
+            matrix[:, i] = observable_data[col].values[:n_periods]
+    return matrix
+
+
+def extract_clicks_matrix(observable_data, n_periods: int, channel_names: list[str]) -> np.ndarray:
+    """Extract per-channel clicks into a matrix (n_periods, n_channels)."""
+    n_ch = len(channel_names)
+    matrix = np.zeros((n_periods, n_ch), dtype=np.float32)
+    for i, name in enumerate(channel_names):
+        col = f"{name}_clicks"
+        if col in observable_data.columns:
+            matrix[:, i] = observable_data[col].values[:n_periods]
+    return matrix
+
+
 def ground_truth_to_decomposition(
     ground_truth: pd.DataFrame,
     channel_names: list[str],
@@ -460,12 +482,34 @@ def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
     y_batch = np.zeros((n_samples, max_periods), dtype=np.float64)
     spend_batch = np.zeros((n_samples, max_periods, max_ch), dtype=np.float64)
 
+    # Impressions and clicks: optional, same shape convention as spend_matrix
+    has_impressions = "impressions_matrix" in tuples[0]
+    has_clicks = "clicks_matrix" in tuples[0]
+    impressions_batch = (
+        np.zeros((n_samples, max_periods, max_ch), dtype=np.float64)
+        if has_impressions
+        else None
+    )
+    clicks_batch = (
+        np.zeros((n_samples, max_periods, max_ch), dtype=np.float64)
+        if has_clicks
+        else None
+    )
+
     for i, t in enumerate(tuples):
         n_t = len(t["y"])
         y_batch[i, :n_t] = t["y"]
         sm = t["spend_matrix"]
         if sm.ndim == 2 and sm.shape[1] > 0:
             spend_batch[i, :n_t, :sm.shape[1]] = sm
+        if has_impressions:
+            im = t["impressions_matrix"]
+            if im.ndim == 2 and im.shape[1] > 0:
+                impressions_batch[i, :n_t, :im.shape[1]] = im
+        if has_clicks:
+            cm = t["clicks_matrix"]
+            if cm.ndim == 2 and cm.shape[1] > 0:
+                clicks_batch[i, :n_t, :cm.shape[1]] = cm
 
     # Build extended truth vectors if present
     has_ext_truth = "ext_truth_vector" in tuples[0]
@@ -505,6 +549,10 @@ def save_batch(tuples: list[dict], output_path: str, batch_id: int) -> None:
         y=y_batch,
         spend=spend_batch,
     )
+    if impressions_batch is not None:
+        save_kwargs["impressions"] = impressions_batch
+    if clicks_batch is not None:
+        save_kwargs["clicks"] = clicks_batch
     if ext_truth_vectors is not None:
         save_kwargs["ext_truth_vectors"] = ext_truth_vectors
     if context_batch is not None:
