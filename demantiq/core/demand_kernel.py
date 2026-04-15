@@ -83,6 +83,25 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     else:
         endog_result = None
 
+    # Generate synthetic impressions and clicks per channel (from final spend)
+    # impressions_t = (spend_t / cpm) * 1000 * (1 + log_normal_noise)
+    # clicks_t = impressions_t * ctr * (1 + small_noise)
+    impressions_dict: dict[str, np.ndarray] = {}
+    clicks_dict: dict[str, np.ndarray] = {}
+    noise_rng = np.random.default_rng(int(config.seed) + 9999)
+    for ch in config.channels:
+        ch_spend = spend[ch.name]
+        expected_impressions = (ch_spend / ch.cpm) * 1000.0
+        imp_noise = np.exp(noise_rng.normal(0.0, 0.1, size=len(ch_spend)))
+        impressions_ch = expected_impressions * imp_noise
+        impressions_ch = np.maximum(impressions_ch, 0.0)
+        impressions_dict[ch.name] = impressions_ch
+
+        expected_clicks = impressions_ch * ch.ctr
+        clk_noise = np.exp(noise_rng.normal(0.0, 0.1, size=len(ch_spend)))
+        clicks_ch = expected_clicks * clk_noise
+        clicks_dict[ch.name] = np.maximum(clicks_ch, 0.0)
+
     # Steps 4-6: Per-channel adstock, saturation, media effects
     channel_contributions = {}
     channel_scales = {}
@@ -193,7 +212,8 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         )
 
     # Build observable data
-    observable = _build_observable(config, y, spend, pricing_result, distribution_result,
+    observable = _build_observable(config, y, spend, impressions_dict, clicks_dict,
+                                   pricing_result, distribution_result,
                                    revenue, competition_result, macro_result)
 
     # Build ground truth
@@ -218,11 +238,15 @@ def simulate(config: SimulationConfig) -> SimulationResult:
 
 def _build_observable(config: SimulationConfig, y: np.ndarray,
                       spend: dict[str, np.ndarray],
+                      impressions: dict[str, np.ndarray] | None = None,
+                      clicks: dict[str, np.ndarray] | None = None,
                       pricing_result=None, distribution_result=None,
                       revenue=None, competition_result=None,
                       macro_result=None) -> pd.DataFrame:
     """Build the observable dataset (what the model sees)."""
     n = config.n_periods
+    impressions = impressions or {}
+    clicks = clicks or {}
 
     # Generate dates
     if config.granularity == "weekly":
@@ -232,9 +256,11 @@ def _build_observable(config: SimulationConfig, y: np.ndarray,
 
     data = {"date": dates, "y": y}
 
-    # Add spend columns
+    # Add spend, impressions, clicks columns
     for ch in config.channels:
         data[f"{ch.name}_spend"] = spend[ch.name]
+        data[f"{ch.name}_impressions"] = impressions.get(ch.name, np.zeros(n))
+        data[f"{ch.name}_clicks"] = clicks.get(ch.name, np.zeros(n))
 
     # Add pricing columns
     if pricing_result is not None:
