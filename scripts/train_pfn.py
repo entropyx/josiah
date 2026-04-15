@@ -104,10 +104,16 @@ def evaluate_scenario(engine, scenario_name: str | None = None, scenario_seed: i
     spend = np.column_stack([
         result.observable_data[f"{ch}_spend"].values for ch in ch_names
     ]).astype(np.float32)
+    imp = np.column_stack([
+        result.observable_data[f"{ch}_impressions"].values for ch in ch_names
+    ]).astype(np.float32)
+    clk = np.column_stack([
+        result.observable_data[f"{ch}_clicks"].values for ch in ch_names
+    ]).astype(np.float32)
     context = extract_context_matrix(result.observable_data, T).astype(np.float32)
 
     t0 = time.time()
-    inf = engine.infer(y, spend, context, n_ch)
+    inf = engine.infer(y, spend, context, n_ch, impressions=imp, clicks=clk)
     inf_time = time.time() - t0
 
     pred_ch = inf["channel_contributions"]
