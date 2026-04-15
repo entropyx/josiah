@@ -62,7 +62,7 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         SimulationResult with observable data, ground truth, and summary.
     """
     rng = create_rng(config.seed)
-    sub_rngs = create_sub_rngs(rng, 8)  # baseline, spend, noise, pricing, distribution, endogeneity, competition, macro
+    sub_rngs = create_sub_rngs(rng, 9)  # baseline, spend, noise, pricing, distribution, endogeneity, competition, macro, impressions_clicks
 
     n = config.n_periods
 
@@ -84,11 +84,11 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         endog_result = None
 
     # Generate synthetic impressions and clicks per channel (from final spend)
-    # impressions_t = (spend_t / cpm) * 1000 * (1 + log_normal_noise)
-    # clicks_t = impressions_t * ctr * (1 + small_noise)
+    # impressions_t = (spend_t / cpm) * 1000 * exp(N(0, 0.1))
+    # clicks_t = impressions_t * ctr * exp(N(0, 0.1))
     impressions_dict: dict[str, np.ndarray] = {}
     clicks_dict: dict[str, np.ndarray] = {}
-    noise_rng = np.random.default_rng(int(config.seed) + 9999)
+    noise_rng = sub_rngs[8]
     for ch in config.channels:
         ch_spend = spend[ch.name]
         expected_impressions = (ch_spend / ch.cpm) * 1000.0
