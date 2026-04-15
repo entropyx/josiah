@@ -54,6 +54,8 @@ class DemantiqDataset(Dataset):
         all_spend = []
         all_context = []
         all_decomp = []
+        all_impressions = []
+        all_clicks = []
         all_config = []
         all_truth = []
         all_ext_truth = []
@@ -113,6 +115,15 @@ class DemantiqDataset(Dataset):
                     np.zeros((n_in_batch, t_dim, DECOMP_COLS), dtype=np.float64)
                 )
 
+            if "impressions" in data:
+                all_impressions.append(data["impressions"][:n_in_batch])
+            else:
+                all_impressions.append(np.zeros_like(data["spend"][:n_in_batch]))
+            if "clicks" in data:
+                all_clicks.append(data["clicks"][:n_in_batch])
+            else:
+                all_clicks.append(np.zeros_like(data["spend"][:n_in_batch]))
+
             all_channel_names.extend(batch_channel_names[:n_in_batch])
             all_n_periods.extend(batch_n_periods[:n_in_batch])
 
@@ -154,6 +165,20 @@ class DemantiqDataset(Dataset):
                 dec_arr = np.pad(dec_arr, ((0, 0), (0, pad_t_dec), (0, 0)))
             decomp_arrays.append(dec_arr)
 
+        imp_arrays = []
+        clk_arrays = []
+        for imp_arr, clk_arr, sp_arr in zip(all_impressions, all_clicks, all_spend):
+            pad_t = max_t - imp_arr.shape[1]
+            pad_c = max_c - imp_arr.shape[2]
+            if pad_t > 0 or pad_c > 0:
+                imp_arr = np.pad(imp_arr, ((0, 0), (0, pad_t), (0, pad_c)))
+                clk_arr = np.pad(clk_arr, ((0, 0), (0, pad_t), (0, pad_c)))
+            imp_arrays.append(imp_arr)
+            clk_arrays.append(clk_arr)
+
+        self.impressions = np.concatenate(imp_arrays, axis=0).astype(np.float32)
+        self.clicks = np.concatenate(clk_arrays, axis=0).astype(np.float32)
+
         self.y = np.concatenate(y_arrays, axis=0).astype(np.float32)
         self.spend = np.concatenate(spend_arrays, axis=0).astype(np.float32)
         self.context = np.concatenate(context_arrays, axis=0).astype(np.float32)
@@ -182,6 +207,8 @@ class DemantiqDataset(Dataset):
         return {
             "y": torch.from_numpy(self.y[idx]),
             "spend": torch.from_numpy(self.spend[idx]),
+            "impressions": torch.from_numpy(self.impressions[idx]),
+            "clicks": torch.from_numpy(self.clicks[idx]),
             "context": torch.from_numpy(self.context[idx]),
             "decomposition": torch.from_numpy(self.decomposition[idx]),
             "n_periods": self.n_periods[idx],
