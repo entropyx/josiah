@@ -111,6 +111,12 @@ class ScenarioSampler:
                               "max_lag": int(rng.integers(4, 13))}
 
             spend_mean = float(rng.uniform(*spend_mean_range))
+            # Sample CPM (cost per 1000 impressions) — varies by channel type
+            # Range chosen to span realistic values: $1 CPM (email) to $50 CPM (CTV)
+            cpm = float(rng.uniform(1.0, 50.0))
+            # Sample CTR (click-through rate) — varies widely by channel
+            # Range: 0.1% (display) to 10% (search/direct), log-uniform
+            ctr = float(10 ** rng.uniform(-3.0, -1.0))  # log-uniform from 0.001 to 0.1
             channels.append(ChannelConfig(
                 name=name,
                 beta=float(rng.uniform(*beta_range)),
@@ -123,6 +129,8 @@ class ScenarioSampler:
                 spend_std=float(rng.uniform(spend_mean * 0.1, spend_mean * 0.5)),
                 spend_floor=float(rng.choice([0.0, 0.0, 100.0])),
                 correlation_group=f"group_{i % n_groups}",
+                cpm=cpm,
+                ctr=ctr,
             ))
 
         # Periods: 26-260
