@@ -77,12 +77,15 @@ class TrainingPipeline:
             batch_seed = int(rng.integers(0, 2**31))
             n_in_batch = min(self.batch_size, n_total - batch_id * self.batch_size)
 
-            # Generate configs using a fresh sampler seeded per batch
-            # Preserve rich_context and n_fixed_channels from the parent sampler
+            # Generate configs using a fresh sampler seeded per batch.
+            # Preserve rich_context, n_fixed_channels, AND channel_range from
+            # the parent sampler — otherwise batches may generate scenarios
+            # outside the configured channel range.
             batch_sampler = ScenarioSampler(
                 seed=batch_seed,
                 rich_context=self.sampler.rich_context,
                 n_fixed_channels=self.sampler.n_fixed_channels,
+                channel_range=getattr(self.sampler, "channel_range", None),
             )
             configs = batch_sampler.sample(n_in_batch)
 
